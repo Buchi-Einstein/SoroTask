@@ -391,6 +391,122 @@ class HistoryManager {
     }
   }
 
+  /**
+   * Get recent history (for simple debugging/audit)
+   * @param {number} limit - Number of recent records to return
+   * @returns {Promise<Object[]>}
+   */
+  async getRecent(limit = 100) {
+    try {
+      await this.writeQueue;
+      if (!fs.existsSync(HISTORY_FILE)) return [];
+
+      const content = await fs.promises.readFile(HISTORY_FILE, 'utf-8');
+      const lines = content.trim().split('\n');
+      return lines
+        .slice(-limit)
+        .reverse()
+        .map(line => JSON.parse(line));
+    } catch (err) {
+      this.logger.error('Failed to read execution history', { error: err.message });
+      return [];
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Issue #1451 — Blockchain Reorganization Detection & Recovery Tracking
+  // -------------------------------------------------------------------------
+
+  /**
+   * Record a blockchain reorganization event.
+   * This is used to track when the indexer detects a reorg and triggers rollback.
+   *
+   * @param {Object} reorgDetails
+   * @param {number} reorgDetails.rollbackToSequence - The ledger sequence rolled back to
+   * @param {number} reorgDetails.deletedEvents - Number of events deleted
+   * @param {number} reorgDetails.deletedTasks - Number of tasks deleted
+   * @param {number} [reorgDetails.requeuedTasks] - Number of tasks re-queued
+   * @param {number[]} [reorgDetails.affectedTaskIds] - Task IDs affected by the reorg
+   * @param {string} [reorgDetails.reason] - Reason for rollback (e.g., 'hash_mismatch')
+   */
+  recordReorg(reorgDetails) {
+    const entry = {
+      kind: 'blockchain_reorg',
+      timestamp: new Date().toISOString(),
+      ...reorgDetails,
+    };
+
+    this.recentExecutions.push(entry);
+    if (this.recentExecutions.length > this.maxRecentExecutions) {
+      this.recentExecutions.shift();
+    }
+
+    const line = JSON.stringify(entry) + '\n';
+    this.writeQueue = this.writeQueue
+      .then(() => fs.promises.appendFile(HISTORY_FILE, line))
+      .catch((err) => {
+        this.logger.error('Failed to persist reorg record', { error: err.message });
+      });
+
+    this.logger.warn('Blockchain reorganization recorded', reorgDetails);
+    return entry;
+  }
+
+  /**
+   * Record that tasks have been re-queued after a reorg rollback.
+   *
+   * @param {Object} details
+   * @param {number[]} details.taskIds - Task IDs that were re-queued
+   * @param {number} details.rollbackToSequence - The ledger sequence rolled back to
+   * @param {number} details.count - Number of tasks re-queued
+   */
+  recordTaskRequeue(details) {
+    const entry = {
+      kind: 'task_requeue_after_reorg',
+      timestamp: new Date().toISOString(),
+      ...details,
+    };
+
+    this.recentExecutions.push(entry);
+    if (this.recentExecutions.length > this.maxRecentExecutions) {
+      this.recentExecutions.shift();
+    }
+
+    const line = JSON.stringify(entry) + '\n';
+    this.writeQueue = this.writeQueue
+      .then(() => fs.promises.appendFile(HISTORY_FILE, line))
+      .catch((err) => {
+        this.logger.error('Failed to persist task requeue record', { error: err.message });
+      });
+
+    this.logger.info('Task re-queue after reorg recorded', details);
+    return entry;
+  }
+
+  /**
+   * Get reorg-related records from history.
+   *
+   * @param {number} limit
+   * @returns {Promise<Object[]>}
+   */
+  async getReorgHistory(limit = 50) {
+    try {
+      await this.writeQueue;
+      if (!fs.existsSync(HISTORY_FILE)) return [];
+
+      const content = await fs.promises.readFile(HISTORY_FILE, 'utf-8');
+      const lines = content.trim().split('\n');
+      return lines
+        .map(line => JSON.parse(line))
+        .filter(entry => entry.kind === 'blockchain_reorg' || entry.kind === 'task_requeue_after_reorg')
+        .slice(-limit)
+        .reverse();
+    } catch (err) {
+      this.logger.error('Failed to read reorg history', { error: err.message });
+      return [];
+    }
+  }
+
   // -------------------------------------------------------------------------
   // Issue #842 — Audit reporting: CSV + PDF monthly statements
   // -------------------------------------------------------------------------

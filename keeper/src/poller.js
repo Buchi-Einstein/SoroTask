@@ -35,6 +35,7 @@ class TaskPoller {
   constructor(server, contractId, options = {}) {
     this.server = server;
     this.contractId = contractId;
+    this.mempoolSniffer = options.mempoolSniffer || null;
 
     // Structured logger for poller module
     this.logger = normalizeLogger(options.logger);
@@ -174,6 +175,15 @@ class TaskPoller {
     } else {
       this.taskMetadataCache = null;
     }
+  }
+
+  startMempoolSniffer() {
+    if (this.mempoolSniffer && typeof this.mempoolSniffer.start === 'function') this.mempoolSniffer.start();
+    return this.mempoolSniffer;
+  }
+
+  stopMempoolSniffer() {
+    if (this.mempoolSniffer && typeof this.mempoolSniffer.stop === 'function') this.mempoolSniffer.stop();
   }
 
   /**

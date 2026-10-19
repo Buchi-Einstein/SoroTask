@@ -72,6 +72,13 @@ function loadConfig() {
     rpcFailoverLatencyPenaltyThresholdMs: parseInteger(process.env.RPC_FAILOVER_LATENCY_PENALTY_THRESHOLD_MS, 1000),
     networkPassphrase: process.env.NETWORK_PASSPHRASE || process.env.NETWORK_PASSTHRAPE,
     keeperSecret: process.env.KEEPER_SECRET,
+    vault: {
+      primaryAddr: process.env.VAULT_ADDR,
+      secondaryAddr: process.env.VAULT_SECONDARY_ADDR,
+      authMethod: process.env.VAULT_AUTH_METHOD || 'approle',
+      renewFraction: Number(process.env.VAULT_RENEW_FRACTION || 0.75),
+      transitKeyPath: process.env.VAULT_TRANSIT_KEY_PATH,
+    },
     contractId: process.env.CONTRACT_ID,
     pollIntervalMs: parseInteger(process.env.POLLING_INTERVAL_MS, 10000),
     adaptivePollingEnabled: parseBoolean(process.env.ADAPTIVE_POLLING_ENABLED, false),

@@ -4,6 +4,7 @@ const { createLogger } = require('./logger');
 
 // Create logger for account module
 const logger = createLogger('account');
+const { VaultLeaseManager } = require('./vaultLeaseManager');
 
 /**
  * Loads the keeper's keypair and validates its on-chain state.
@@ -284,12 +285,25 @@ async function createHsmSigner(opts = {}) {
 
   if (providerType === 'vault-transit') {
     const { VaultTransitProvider } = require('./hsm/vaultTransitProvider');
+    const leaseManager = opts.leaseManager || ((!opts.vaultToken && !process.env.VAULT_TOKEN)
+      ? new VaultLeaseManager({
+        primary: opts.vaultAddr || process.env.VAULT_ADDR,
+        secondary: opts.vaultSecondaryAddr || process.env.VAULT_SECONDARY_ADDR,
+        authMethod: opts.vaultAuthMethod || process.env.VAULT_AUTH_METHOD,
+        roleId: opts.vaultRoleId || process.env.VAULT_ROLE_ID,
+        secretId: opts.vaultSecretId || process.env.VAULT_SECRET_ID,
+        kubernetesRole: opts.vaultKubernetesRole || process.env.VAULT_K8S_ROLE,
+        kubernetesJwtPath: opts.vaultKubernetesJwtPath || process.env.VAULT_K8S_JWT_PATH,
+        logger: opts.logger,
+      }) : null);
     const hsmProvider = opts.hsmProvider || new VaultTransitProvider({
       vaultAddr: opts.vaultAddr || process.env.VAULT_ADDR,
       vaultToken: opts.vaultToken || process.env.VAULT_TOKEN,
       transitPath: opts.transitPath || process.env.VAULS_TRANSIT_PATH,
       logger: opts.logger,
+      leaseManager,
     });
+    if (leaseManager) await leaseManager.start();
     const signer = new MultiSigHSMSigner(
       hsmProvider,
       [keyId],
@@ -399,4 +413,5 @@ module.exports = {
   fetchSecretFromVault,
   fetchSecretFromAWS,
   clearSecretMemory,
+  VaultLeaseManager,
 };

@@ -16,7 +16,6 @@ const { GasMonitor } = require("./src/gasMonitor");
 const HistoryManager = require("./src/history");
 const { StreamHub } = require("./src/streamHub");
 const { ApiGateway } = require("./src/apiGateway");
-const { FailurePredictor, KeeperReputationScorer } = require("./src/insights");
 const { DeadLetterQueue } = require("./src/deadLetter");
 const { FailurePredictor, KeeperReputationScorer, ProfitabilityEstimator } = require("./src/insights");
 const { GasForecaster } = require("./src/gasForecaster");
@@ -32,6 +31,12 @@ const { createDefaultFilterChain } = require("./src/taskFilter");
 const { getRedisClient } = require("./src/lock");
 const { computeAdaptivePollingInterval } = require("./src/adaptiveScheduler");
 const { withSpan } = require("./src/otel");
+const { FraudDetectionService } = require("./src/fraudDetection");
+const { TaskMetadataCache } = require("./src/taskMetadataCache");
+const { KeeperAlertManager } = require("./src/keeperAlerts");
+const { WebhookAuthProtocol, InMemoryReplayStore } = require("./src/webhookAuth");
+const { WebhookTriggerHandler } = require("./src/webhookTrigger");
+const { KeeperP2PNetwork } = require("./src/p2pNetwork");
 
 // Create root logger for the main module
 const logger = createLogger("keeper");
@@ -59,6 +64,11 @@ async function main() {
     logger.error("Configuration error", { error: err.message });
     process.exit(1);
   }
+
+  const server = new Server(config.rpcUrl, {
+    allowHttp: Boolean(config.rpcUrl && config.rpcUrl.startsWith("http://")),
+  });
+  const alertManager = new KeeperAlertManager();
 
   let keeperData;
   try {
@@ -98,6 +108,7 @@ async function main() {
   // tasks that aren't yet ready for their backoff retry).
   const deadLetterQueue = new DeadLetterQueue({
     logger: createLogger("dead-letter-queue"),
+  });
   // Issue #781 — profitability gate. gasForecaster accumulates per-task fee
   // history (fed by executeTask below) so profitabilityEstimator can compare
   // a task's bounty against its forecasted cost before spending a real fee
@@ -106,7 +117,7 @@ async function main() {
   const gasForecaster = new GasForecaster(createLogger("gas-forecaster"));
   const profitabilityEstimator = new ProfitabilityEstimator({
     logger: createLogger("profitability"),
-    threshold: config.profitabilityGate.minNetProfitStroops,
+    threshold: config.profitabilityGate?.minNetProfitStroops || 0,
   });
   const shardConfig = normalizeShardConfig({
     shardIndex: config.shardIndex,
@@ -181,6 +192,11 @@ async function main() {
     logger.fatal("Startup Validation Failed", { error: err.message });
     process.exit(1);
   }
+
+  metricsServer.updateHealth({
+    rpcConnected: true,
+    lastPollAt: new Date(),
+  });
 
    const idempotencyGuard = new ExecutionIdempotencyGuard({
      logger: createLogger("idempotency"),
@@ -417,7 +433,7 @@ async function main() {
     // Issue #781 — profitability gate. Only skips when the forecaster has
     // 'high' confidence (enough historical samples) for this task; with no
     // or thin history it defers to normal execution rather than guessing.
-    if (config.profitabilityGate.enabled) {
+    if (config.profitabilityGate?.enabled) {
       const task = registry.tasks.get(taskId) || registry.tasks.get(String(taskId));
       const forecast = gasForecaster.forecastTaskGas(taskId, Number(task?.gas_balance) || 0);
       if (forecast.confidence === 'high') {
@@ -554,7 +570,7 @@ async function main() {
   };
 
   // Initialize webhook authentication and handler if enabled
-  if (config.inboundWebhooks.enabled) {
+  if (config.inboundWebhooks?.enabled) {
     logger.info("Initializing inbound webhook handler");
     
     const webhookAuthProtocol = new WebhookAuthProtocol({
@@ -590,8 +606,11 @@ async function main() {
 
   // Initialize event-driven task registry
   const registry = new TaskRegistry(server, config.contractId, {
-    startLedger: parseInt(process.env.START_LEDGER || "0", 10),
+    startLedger: parseInt(process.env.START_LEDGER || "1", 10) || 1,
     logger: createLogger("registry"),
+    resolverCacheEnabled: config.resolverCacheEnabled,
+    resolverCacheTtlSeconds: config.resolverCacheTtlSeconds,
+    resolverCacheMaxSize: config.resolverCacheMaxSize,
   });
   await registry.init();
 
@@ -730,12 +749,6 @@ async function main() {
     alertManager.stopRpcMonitor();
   });
 
-  // Register SLA monitor cleanup
-  shutdownManager.registerResource("sla-monitor", async () => {
-    logger.info("Stopping SLA monitor");
-    await slaMonitor.stop();
-  });
-
   // Register registry cleanup
   shutdownManager.registerResource("task-registry", async () => {
     logger.info("Closing task registry");
@@ -753,11 +766,6 @@ async function main() {
   shutdownManager.registerResource("rpc-server", async () => {
     logger.info("Closing RPC server connection");
     // Server doesn't have explicit close, but we log it
-  });
-
-  shutdownManager.registerResource("rpc-failover", async () => {
-    logger.info("Stopping RPC failover manager");
-    failoverClient.stop();
   });
 
   // Register idempotency guard persistence
@@ -900,11 +908,15 @@ async function main() {
 
       // Poll for due tasks
       // Pass registry so cached gas/timing filters can read previously fetched values
-      const dueTaskIds = await poller.pollDueTasks(shardSelection.ownedTaskIds, {
-        registry,
-        idempotencyGuard,
-        includeContext: true,
-      });
+      const dueTaskIds = await withSpan(
+        'poll_cycle',
+        () => poller.pollDueTasks(shardSelection.ownedTaskIds, {
+          registry,
+          idempotencyGuard,
+          includeContext: true,
+        }),
+        { ownedTaskCount: shardSelection.ownedTaskIds.length },
+      );
       dueCountThisCycle = dueTaskIds.length;
 
       // Issue #783: skip tasks the dead-letter queue has quarantined
@@ -927,15 +939,6 @@ async function main() {
           taskIds: quarantinedSkipped,
         });
       }
-      const dueTaskIds = await withSpan(
-        'poll_cycle',
-        () => poller.pollDueTasks(shardSelection.ownedTaskIds, {
-          registry,
-          idempotencyGuard,
-          includeContext: true,
-        }),
-        { ownedTaskCount: shardSelection.ownedTaskIds.length },
-      );
 
       if (executableTaskIds.length > 0) {
         const lockSnapshot = idempotencyGuard.getSnapshot();
@@ -966,6 +969,11 @@ async function main() {
       } else {
         logger.info("No tasks due for execution");
       }
+
+      metricsServer.updateHealth({
+        lastPollAt: new Date(),
+        rpcConnected: true,
+      });
 
       } catch (error) {
         cycleErrored = true;

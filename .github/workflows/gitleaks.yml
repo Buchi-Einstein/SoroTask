@@ -27,4 +27,4 @@ jobs:
           tar --extract --gzip --file /tmp/gitleaks.tar.gz --directory /tmp
 
       - name: Run Gitleaks
-        run: /tmp/gitleaks git . --config .gitleaks.toml --redact
+        run: /tmp/gitleaks git . --config .gitleaks.toml --redact --verbose

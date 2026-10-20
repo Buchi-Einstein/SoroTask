@@ -24,16 +24,21 @@ const {
 } = require("./graphql/db");
 const { WebhookDispatcher } = require("./webhooks/dispatcher");
 const { ParallelLedgerParser } = require("./parallelParser");
+const { CacheInvalidationEngine } = require("./cacheInvalidator");
+const { LedgerGapDetector } = require("./ledgerGapDetector");
+const { HighAvailabilityManager } = require("./ha");
+const { SyntheticMonitor } = require("./syntheticMonitor");
+const { updateLedgerMetrics, recordEventIndexed } = require("./metrics");
 
 // Configuration
-const RPC_URL = "https://soroban-testnet.stellar.org"; // Change as needed
+const RPC_URL = process.env.SOROBAN_RPC_URL || "https://soroban-testnet.stellar.org"; // Change as needed
 const CONTRACT_ID = process.env.CONTRACT_ID || "CCKANVNJJIKGYU4TYTZBGL5JQVLPW33KQUW6JFHPLKXDLQEZETHOUAMJ"; // Replace with actual contract ID
 const POLL_INTERVAL_MS = 6000; // 6 seconds
 const RECONCILE_INTERVAL_MS = 300000; // 5 minutes
 const STALE_CLEANUP_INTERVAL_MS = 86400000; // 24 hours
 
 // Initialize RPC server
-const rpc = new SorobanRpc.Server(RPC_URL);
+const rpc = new SorobanRpc.Server(RPC_URL, { allowHttp: RPC_URL.startsWith("http://") });
 const contract = new Contract(CONTRACT_ID);
 
 // Database connection is handled by the PostgreSQL pool in ./graphql/db.js (Issue #1064)
@@ -661,7 +666,7 @@ if (!handleCLI()) {
     db,
     rpc,
     contractId: CONTRACT_ID,
-    intervalMs: Number(process.env.SYNTHETIC_INTERVAL_MS || 60_000),
+    intervalMs: Number(process.env.SYNTHETIC_INTERVAL_MS || 10 * 60_000),
     latencyThresholdMs: Number(process.env.SYNTHETIC_LATENCY_THRESHOLD_MS || 30_000),
     timeoutMs: Number(process.env.SYNTHETIC_TIMEOUT_MS || 120_000),
     webhookUrl: process.env.SYNTHETIC_MONITOR_WEBHOOK_URL || null,
@@ -698,6 +703,37 @@ process.on("SIGINT", () => {
   });
 });
 
+const DEBEZIUM_CONNECTOR_CONFIG = {
+  name: 'postgres-cdc-keeper-connector',
+  config: {
+    'connector.class': 'io.debezium.connector.postgresql.PostgresConnector',
+    'plugin.name': 'pgoutput',
+    'database.hostname': process.env.PG_HOST || 'localhost',
+    'database.port': process.env.PG_PORT || '5432',
+    'database.user': process.env.PG_USER || 'postgres',
+    'database.password': process.env.PG_PASSWORD || 'postgres',
+    'database.dbname': process.env.PG_DATABASE || 'sorotask',
+    'database.server.name': 'sorotask_cdc',
+    'table.include.list': 'public.tasks,public.task_configs',
+    'tombstones.on.delete': 'false',
+    'decimal.handling.mode': 'double',
+  },
+};
+
+async function publishCDCMutation(producer, topic, mutationEvent) {
+  if (!producer || typeof producer.send !== 'function') return;
+  const key = mutationEvent?.payload?.after?.id || mutationEvent?.payload?.before?.id || null;
+  await producer.send({
+    topic: topic || process.env.KEEPER_CDC_TOPIC || 'sorotask.cdc.keeper.mutations',
+    messages: [
+      {
+        key: key !== null ? String(key) : null,
+        value: JSON.stringify(mutationEvent),
+      },
+    ],
+  });
+}
+
 module.exports = {
   handleEvent,
   reconcileTask,
@@ -705,5 +741,7 @@ module.exports = {
   HighAvailabilityManager,
   CacheInvalidationEngine,
   ParallelLedgerParser,
+  DEBEZIUM_CONNECTOR_CONFIG,
+  publishCDCMutation,
 };
 

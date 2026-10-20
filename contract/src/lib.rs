@@ -1350,6 +1350,7 @@ impl<'a> Drop for ReentrancyGuard<'a> {
     }
 }
 
+pub mod carbon;
 pub mod ccip;
 pub mod mempool;
 pub mod resolver;
@@ -2259,6 +2260,28 @@ impl SoroTaskContract {
         env.storage()
             .persistent()
             .set(&DataKey::Guardians, &guardians);
+    }
+
+    /// Configures carbon-offset accounting for keeper executions. Admin-gated
+    /// once an admin is set, like `set_guardians`. (SC-PROD-48)
+    pub fn set_carbon_config(env: Env, config: carbon::CarbonConfig) {
+        if let Some(admin) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::AdminAddress)
+        {
+            admin.require_auth();
+        }
+        carbon::set_config(&env, &config);
+    }
+
+    pub fn get_carbon_config(env: Env) -> Option<carbon::CarbonConfig> {
+        carbon::get_config(&env)
+    }
+
+    /// Cumulative instructions, outstanding carbon debt and retirement totals.
+    pub fn get_carbon_ledger(env: Env) -> carbon::CarbonLedger {
+        carbon::get_ledger(&env)
     }
 
     pub fn get_guardians(env: Env) -> Vec<Address> {
@@ -5156,6 +5179,7 @@ impl SoroTaskContract {
             // ── 10. Fee calculation ─────────────────────────────────────
             // Combine dynamic gas metering with staking fee discounts
             let calculated_fee = gas_meter.calculate_fee(env);
+            carbon::record_consumption(env, gas_meter.consumed_cpu(env));
 
             let protocol_fee_bps: u32 = env
                 .storage()

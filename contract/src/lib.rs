@@ -6637,6 +6637,46 @@ impl SoroTaskContract {
         exit_security_guard(&env);
     }
 
+    /// Boosts a task's gas balance with third-party funds (Issue #1420).
+    ///
+    /// Any address can top up an existing task. The tokens go into the task's
+    /// gas balance and escrow exactly like `deposit_gas`, and the sponsor's
+    /// cumulative share is tracked so it can be attributed and refunded later.
+    pub fn boost_task(env: Env, task_id: u64, sponsor: Address, amount: i128) -> i128 {
+        if amount <= 0 {
+            panic_with_error!(&env, Error::InvalidBounty);
+        }
+        enter_security_guard(&env);
+        Self::deposit_gas_internal(&env, task_id, &sponsor, amount, false);
+        let share = storage::record_booster_contribution(&env, task_id, &sponsor, amount);
+        exit_security_guard(&env);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "TaskBoosted"),
+                Symbol::new(&env, "v1"),
+                task_id,
+            ),
+            (sponsor, amount, share),
+        );
+        share
+    }
+
+    /// Cumulative amount `sponsor` has boosted `task_id` with.
+    pub fn get_booster_share(env: Env, task_id: u64, sponsor: Address) -> i128 {
+        storage::booster_share(&env, task_id, &sponsor)
+    }
+
+    /// Total booster contributions to `task_id` across all sponsors.
+    pub fn get_booster_total(env: Env, task_id: u64) -> i128 {
+        storage::booster_total(&env, task_id)
+    }
+
+    /// Distinct sponsors that have boosted `task_id`.
+    pub fn get_booster_sponsors(env: Env, task_id: u64) -> Vec<Address> {
+        storage::booster_sponsors(&env, task_id)
+    }
+
     /// Withdraws gas tokens from a task's balance.
     /// Only the task creator can withdraw.
     pub fn withdraw_gas(env: Env, task_id: u64, amount: i128) {
@@ -15256,3 +15296,6 @@ mod test_task_bundle;
 
 #[cfg(test)]
 mod test_state_channel;
+
+#[cfg(test)]
+mod test_booster;

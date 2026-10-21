@@ -478,6 +478,10 @@ class TaskPoller {
       context.resolver = result.resolver;
     }
 
+    if (result.deps && Array.isArray(result.deps)) {
+      context.deps = result.deps;
+    }
+
     return {
       taskId: result.taskId,
       correlationId: result.correlationId,
@@ -742,6 +746,7 @@ class TaskPoller {
         isDue,
         taskId,
         reason,
+        deps: taskConfig.deps || [],
         lateness: isDue ? lateness : 0,
         isUnacceptablyLate,
         correlationId,
@@ -1005,6 +1010,8 @@ class TaskPoller {
       if (raw.args !== undefined) config.args = raw.args;
       if (raw.resolver !== undefined) config.resolver = raw.resolver;
       if (raw.whitelist !== undefined) config.whitelist = raw.whitelist;
+      if (raw.deps !== undefined) config.deps = raw.deps;
+      if (raw.dependencies !== undefined) config.deps = raw.dependencies;
 
       return config;
     } catch (error) {

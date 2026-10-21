@@ -162,16 +162,17 @@ class KafkaTaskStream {
 }
 
 // ---------------------------------------------------------------------------
-// #845 — Task Dependency Graph Topology Solver
+// #845 / #1448 — Task Dependency Graph Topology Solver & Tarjan SCC Cycle Engine
 // ---------------------------------------------------------------------------
 // DependencyGraph builds a directed acyclic graph (DAG) from task dependency
 // declarations and resolves an optimal parallel execution order using
-// Kahn's algorithm for topological sort.  Independent tasks are grouped into
-// concurrent execution batches, reducing total DAG completion time.
+// topological sort. It builds an in-memory adjacency list, detects circular
+// dependencies immediately using Tarjan's strongly connected components algorithm,
+// and ensures parent failures abort child tasks cleanly.
 
 class DependencyGraph {
   constructor() {
-    /** @type {Map<string, Set<string>>} taskId -> set of taskIds it depends on */
+    /** @type {Map<string, Set<string>>} taskId -> set of taskIds it depends on (child -> parents) */
     this.edges = new Map();
     /** @type {Set<string>} all known node ids */
     this.nodes = new Set();
@@ -195,15 +196,147 @@ class DependencyGraph {
   }
 
   /**
-   * Compute batches of independent tasks using Kahn's topological sort.
+   * Returns in-memory adjacency list (parent -> array of dependent children).
+   * @returns {Map<string, string[]>}
+   */
+  getAdjacencyList() {
+    const adj = new Map();
+    for (const node of this.nodes) {
+      adj.set(node, []);
+    }
+    for (const [child, parents] of this.edges) {
+      for (const parent of parents) {
+        if (!adj.has(parent)) adj.set(parent, []);
+        adj.get(parent).push(child);
+      }
+    }
+    return adj;
+  }
+
+  /**
+   * Detects cycles using Tarjan's strongly connected components algorithm (#1448).
+   * Returns detected circular dependency cycles immediately.
+   *
+   * @returns {{ hasCycles: boolean, cycles: string[][], cyclicTaskIds: Set<string> }}
+   */
+  detectCycles() {
+    let index = 0;
+    const indices = new Map();
+    const lowlink = new Map();
+    const onStack = new Map();
+    const stack = [];
+    const sccs = [];
+
+    const strongConnect = (v) => {
+      indices.set(v, index);
+      lowlink.set(v, index);
+      index++;
+      stack.push(v);
+      onStack.set(v, true);
+
+      // Traversal following dependency edges (child -> parent)
+      const dependencies = this.edges.get(v) || new Set();
+      for (const dep of dependencies) {
+        if (!indices.has(dep)) {
+          strongConnect(dep);
+          lowlink.set(v, Math.min(lowlink.get(v), lowlink.get(dep)));
+        } else if (onStack.get(dep)) {
+          lowlink.set(v, Math.min(lowlink.get(v), indices.get(dep)));
+        }
+      }
+
+      if (lowlink.get(v) === indices.get(v)) {
+        const scc = [];
+        let w;
+        do {
+          w = stack.pop();
+          onStack.set(w, false);
+          scc.push(w);
+        } while (w !== v);
+        sccs.push(scc);
+      }
+    };
+
+    for (const node of this.nodes) {
+      if (!indices.has(node)) {
+        strongConnect(node);
+      }
+    }
+
+    // Filter SCCs: an SCC is a cycle if length > 1, or length == 1 with a self-loop
+    const cycles = sccs.filter(
+      (scc) => scc.length > 1 || (scc.length === 1 && (this.edges.get(scc[0]) || new Set()).has(scc[0]))
+    );
+
+    const cyclicTaskIds = new Set();
+    for (const cycle of cycles) {
+      for (const id of cycle) {
+        cyclicTaskIds.add(id);
+      }
+    }
+
+    return {
+      hasCycles: cycles.length > 0,
+      cycles,
+      cyclicTaskIds,
+    };
+  }
+
+  /**
+   * Find all transitive dependent children of a task.
+   * @param {string|number} taskId
+   * @returns {Set<string>}
+   */
+  findTransitiveDependents(taskId) {
+    const id = String(taskId);
+    const dependents = new Set();
+    const adj = this.getAdjacencyList();
+
+    const dfs = (curr) => {
+      const children = adj.get(curr) || [];
+      for (const child of children) {
+        if (!dependents.has(child)) {
+          dependents.add(child);
+          dfs(child);
+        }
+      }
+    };
+
+    dfs(id);
+    return dependents;
+  }
+
+  /**
+   * Checks if any parent or ancestor of taskId has failed.
+   * @param {string|number} taskId
+   * @param {Set<string|number>} failedTasks
+   * @returns {string|null}
+   */
+  getFailedParent(taskId, failedTasks) {
+    if (!failedTasks || failedTasks.size === 0) return null;
+    const parents = this.edges.get(String(taskId));
+    if (!parents) return null;
+
+    for (const p of parents) {
+      if (failedTasks.has(p) || failedTasks.has(Number(p))) {
+        return p;
+      }
+      const ancestorFail = this.getFailedParent(p, failedTasks);
+      if (ancestorFail) return ancestorFail;
+    }
+    return null;
+  }
+
+  /**
+   * Compute batches of independent tasks using topological sort.
    * Tasks in the same batch have no dependencies on each other and can be
-   * executed concurrently.  Tasks not registered in the graph are returned
-   * as a single independent batch at the front.
+   * executed concurrently. Tasks with detected cycles are excluded from valid batches.
    *
    * @param {string[]} taskIds - The full list of task IDs to schedule
+   * @param {Object} [options]
    * @returns {string[][]} Ordered array of concurrent batches
    */
-  resolveBatches(taskIds) {
+  resolveBatches(taskIds, options = {}) {
     const ids = taskIds.map(String);
     const inGraph = ids.filter((id) => this.nodes.has(id));
     const notInGraph = ids.filter((id) => !this.nodes.has(id));
@@ -212,16 +345,20 @@ class DependencyGraph {
       return notInGraph.length > 0 ? [notInGraph] : [];
     }
 
-    // Build in-degree map restricted to the requested taskIds
-    const inDegree = new Map();
-    const dependents = new Map(); // dep -> list of tasks that depend on it
+    // Run Tarjan SCC cycle detection
+    const { hasCycles, cyclicTaskIds } = this.detectCycles();
+    const nonCyclicNodes = inGraph.filter((id) => !cyclicTaskIds.has(id));
 
-    for (const id of inGraph) {
+    // Build in-degree map restricted to non-cyclic nodes
+    const inDegree = new Map();
+    const dependents = new Map();
+
+    for (const id of nonCyclicNodes) {
       inDegree.set(id, 0);
       dependents.set(id, []);
     }
 
-    for (const id of inGraph) {
+    for (const id of nonCyclicNodes) {
       const deps = this.edges.get(id) || new Set();
       for (const dep of deps) {
         if (inDegree.has(dep)) {
@@ -232,7 +369,7 @@ class DependencyGraph {
     }
 
     const batches = [];
-    let currentBatch = inGraph.filter((id) => inDegree.get(id) === 0);
+    let currentBatch = nonCyclicNodes.filter((id) => inDegree.get(id) === 0);
 
     while (currentBatch.length > 0) {
       batches.push([...currentBatch]);
@@ -247,10 +384,11 @@ class DependencyGraph {
       currentBatch = nextBatch;
     }
 
-    // Remaining tasks with non-zero in-degree form a cycle — execute them
-    // unconditionally in a final batch rather than deadlocking.
-    const remaining = inGraph.filter((id) => (inDegree.get(id) || 0) > 0);
-    if (remaining.length > 0) batches.push(remaining);
+    // If options.includeCyclicBatch is explicitly requested (fallback compatibility)
+    if (hasCycles && options.includeCyclicBatch) {
+      const remaining = Array.from(cyclicTaskIds).filter((id) => ids.includes(id));
+      if (remaining.length > 0) batches.push(remaining);
+    }
 
     // Prepend independent tasks that were not in the graph at all
     if (notInGraph.length > 0) batches.unshift(notInGraph);
@@ -354,15 +492,27 @@ class ExecutionQueue extends EventEmitter {
   constructor(limit, metricsServer, arg = {}, options = {}) {
     super();
 
-    // Support legacy signature: (limit, metricsServer, retryScheduler)
-    const isLegacy = arg && typeof arg.scheduleRetry === 'function';
-    const opts = isLegacy ? options : arg;
+    let opts = {};
+    let parsedLimit = limit;
+    let metrics = metricsServer;
+
+    if (typeof limit === 'object' && limit !== null) {
+      opts = limit;
+      parsedLimit = opts.concurrency || opts.limit;
+      metrics = opts.metricsServer || opts.metrics;
+    } else {
+      const isLegacy = arg && typeof arg.scheduleRetry === 'function';
+      opts = isLegacy ? options : (arg || {});
+      if (isLegacy) {
+        opts = { ...opts, retryScheduler: arg };
+      }
+    }
 
     this.logger = opts.logger || createLogger('queue');
-    this.metricsServer = metricsServer;
+    this.metricsServer = metrics;
 
     this.idempotencyGuard = opts.idempotencyGuard || null;
-    this.retryScheduler = isLegacy ? arg : (opts.retryScheduler || new RetryScheduler(opts.retryScheduler));
+    this.retryScheduler = opts.retryScheduler || new RetryScheduler(opts.retryScheduler);
 
     // #847 — Kafka / Redpanda event stream ingestion
     // Pass opts.kafkaStream to inject a pre-built KafkaTaskStream instance
@@ -396,7 +546,7 @@ class ExecutionQueue extends EventEmitter {
     this.zkProver = opts.zkProver || null;
 
     this.concurrencyLimit = parseInt(
-      limit || process.env.MAX_CONCURRENT_EXECUTIONS || DEFAULT_CONCURRENCY,
+      parsedLimit || process.env.MAX_CONCURRENT_EXECUTIONS || DEFAULT_CONCURRENCY,
       10,
     );
 
@@ -522,6 +672,20 @@ class ExecutionQueue extends EventEmitter {
       this.dependencyGraph.addTask(item.taskId, deps);
     }
     const taskIdOrder = taskItems.map((i) => i.taskId);
+    // #1448 — Detect circular dependencies immediately via Tarjan's SCC algorithm
+    const cycleReport = this.dependencyGraph.detectCycles();
+    if (cycleReport.hasCycles) {
+      this.logger.error('Circular dependency detected immediately via Tarjan SCC algorithm', {
+        cycles: cycleReport.cycles,
+      });
+      this.emit('task:cycle_detected', cycleReport);
+      for (const cyclicId of cycleReport.cyclicTaskIds) {
+        this.emitTaskEvent('task:aborted', cyclicId, {
+          reason: 'circular_dependency',
+          cycles: cycleReport.cycles,
+        });
+      }
+    }
     const batches = this.dependencyGraph.resolveBatches(taskIdOrder);
 
     // Build a lookup so we can find the full taskItem by id quickly
@@ -545,6 +709,23 @@ class ExecutionQueue extends EventEmitter {
           }
 
           const taskId = taskItem.taskId;
+
+          // #1448 — Parent failures abort child tasks cleanly
+          const failedParent = this.dependencyGraph.getFailedParent(taskId, this.failedTasks);
+          if (failedParent) {
+            this.logger.warn('Child task aborted cleanly because parent task failed', {
+              taskId,
+              failedParent,
+            });
+            this.emitTaskEvent('task:aborted', taskId, {
+              reason: 'parent_failed',
+              failedParent,
+              taskId,
+            });
+            this.depth = Math.max(this.depth - 1, 0);
+            return;
+          }
+
           const initialContext = taskItem.context || {};
           let attemptContext = { ...initialContext };
           let distributedLockToken = null;
@@ -1501,6 +1682,7 @@ class StressBenchmarkHarness {
 
 module.exports = {
   ExecutionQueue,
+  TaskQueue: ExecutionQueue,
   KafkaTaskStream,
   DependencyGraph,
   generateSyntheticTasks,

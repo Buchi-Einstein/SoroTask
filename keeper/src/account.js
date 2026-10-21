@@ -410,6 +410,58 @@ function recordAccountLedgerFee(sample, tracker = getAdaptiveGasTracker()) {
   return tracker.recordLedgerSample(sample);
 }
 
+/**
+ * Batch verify signatures for Stellar transactions and account actions (#1446)
+ * Uses high-performance SIMD/FFI accelerated verifier with seamless Node.js crypto fallback.
+ *
+ * @param {Array<{ signature: Buffer, messageHash: Buffer, publicKey: string|Buffer }>} items
+ * @param {Object} [options]
+ * @returns {{ valid: boolean[], allValid: boolean, verifiedCount: number, errorCount: number }}
+ */
+function verifyAccountBatchSignatures(items, options = {}) {
+  const { getSignatureVerifier } = require('./crypto/signatureVerifier');
+  const verifier = (options && options.verifier) || getSignatureVerifier();
+
+  const batch = items.map((item) => {
+    let rawPub = item.publicKey;
+    if (typeof rawPub === 'string' && rawPub.startsWith('G')) {
+      try {
+        rawPub = StrKey.decodeEd25519PublicKey(rawPub);
+      } catch (_e) {
+        // fallback to original string if not StrKey encoded
+      }
+    }
+    return {
+      message: item.messageHash || item.message,
+      signature: item.signature,
+      publicKey: rawPub,
+    };
+  });
+
+  return verifier.batchVerifyEd25519(batch);
+}
+
+/**
+ * Batch verify multiple signatures against a single transaction hash
+ * @param {Array<Buffer>} signatures
+ * @param {Buffer} messageHash
+ * @param {Array<string|Buffer>} publicKeys
+ * @param {Object} [options]
+ * @returns {boolean} True if all signatures are valid
+ */
+function batchVerifyStellarSignatures(signatures, messageHash, publicKeys, options = {}) {
+  if (!Array.isArray(signatures) || !Array.isArray(publicKeys) || signatures.length !== publicKeys.length) {
+    return false;
+  }
+  const items = signatures.map((sig, idx) => ({
+    signature: sig,
+    messageHash,
+    publicKey: publicKeys[idx],
+  }));
+  const result = verifyAccountBatchSignatures(items, options);
+  return result.allValid;
+}
+
 module.exports = {
   initializeKeeperAccount,
   resolveNetworkPassphrase,
@@ -421,6 +473,8 @@ module.exports = {
   fetchSecretFromVault,
   fetchSecretFromAWS,
   clearSecretMemory,
+  verifyAccountBatchSignatures,
+  batchVerifyStellarSignatures,
   AdaptiveGasTracker,
   getAdaptiveGasTracker,
   forecastAccountInclusionFee,

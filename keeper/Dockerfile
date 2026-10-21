@@ -34,7 +34,12 @@ COPY --chown=appuser:appgroup . .
 RUN mkdir -p /app/data /tmp && chown -R appuser:appgroup /app /tmp
 
 VOLUME ["/tmp"]
-EXPOSE 3000
+EXPOSE 3000 3001
+
+STOPSIGNAL SIGTERM
+
+HEALTHCHECK --interval=10s --timeout=5s --start-period=15s --retries=3 \
+  CMD wget --no-verbose --tries=1 --spider http://localhost:3001/health || exit 1
 
 # SECURITY: Run container with non-root UID/GID
 USER appuser

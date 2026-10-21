@@ -3,6 +3,7 @@ const { createRateLimiter } = require('./concurrency');
 const { DistributedRateLimiter } = require('./distributedRateLimiter');
 const { createLogger } = require('./logger');
 const { validateTaskPayload } = require('./taskValidator');
+const { BytecodeScanner } = require('./bytecodeScanner');
 const { TaskFilterChain } = require('./taskFilter');
 const { SimulationCache } = require('./simulationCache');
 const { TaskMetadataCache } = require('./taskMetadataCache');
@@ -51,6 +52,7 @@ class TaskPoller {
     this.oracleAggregator = options.oracleAggregator || null;
     this.fraudDetection = options.fraudDetection || null;
     this.readinessPredictor = options.readinessPredictor || new TaskReadinessPredictor({ logger: this.logger });
+    this.bytecodeScanner = options.bytecodeScanner || new BytecodeScanner(options);
     this.resolverFailureMode = options.resolverFailureMode || process.env.RESOLVER_FAILURE_MODE || 'skip';
     this.shardLabel = options.shardLabel || null;
     this.driftWarningSeconds = parseInt(
@@ -478,6 +480,10 @@ class TaskPoller {
       context.resolver = result.resolver;
     }
 
+    if (result.deps && Array.isArray(result.deps)) {
+      context.deps = result.deps;
+    }
+
     return {
       taskId: result.taskId,
       correlationId: result.correlationId,
@@ -567,8 +573,31 @@ class TaskPoller {
         registry.updateTask(taskId, { ...taskConfig, status: taskConfig.gas_balance > 0 ? 'active' : 'low_gas' });
       }
 
+      // Pre-poll bytecode safety scanner (#1447)
+      if (this.bytecodeScanner) {
+        if (this.bytecodeScanner.isBlacklisted(taskConfig.target)) {
+          this.logger.warn('Task target contract is blacklisted due to bytecode vulnerability', {
+            taskId,
+            target: taskConfig.target,
+          });
+          return { isDue: false, taskId, reason: 'contract_blacklisted', correlationId };
+        }
+
+        if (taskConfig.bytecode) {
+          const scanResult = this.bytecodeScanner.scan(taskConfig.bytecode, { contractId: taskConfig.target });
+          if (!scanResult.safe) {
+            taskLogger.warn('Task contract bytecode failed static analysis', {
+              taskId,
+              target: taskConfig.target,
+              vulnerabilities: scanResult.vulnerabilities,
+            });
+            return { isDue: false, taskId, reason: 'vulnerable_bytecode', correlationId };
+          }
+        }
+      }
+
       // Validate task payload size and shape
-      const validation = validateTaskPayload(taskConfig, taskConfig.args || []);
+      const validation = validateTaskPayload(taskConfig, taskConfig.args || [], { scanner: this.bytecodeScanner });
       if (!validation.isValid) {
         this.logger.error('Task rejected due to malformed payload', { taskId, errors: validation.errors.join(', ') });
         return { isDue: false, taskId, reason: 'invalid_payload' };
@@ -728,6 +757,7 @@ class TaskPoller {
         isDue,
         taskId,
         reason,
+        deps: taskConfig.deps || [],
         lateness: isDue ? lateness : 0,
         isUnacceptablyLate,
         correlationId,
@@ -992,6 +1022,8 @@ class TaskPoller {
       if (raw.args !== undefined) config.args = raw.args;
       if (raw.resolver !== undefined) config.resolver = raw.resolver;
       if (raw.whitelist !== undefined) config.whitelist = raw.whitelist;
+      if (raw.deps !== undefined) config.deps = raw.deps;
+      if (raw.dependencies !== undefined) config.deps = raw.dependencies;
 
       return config;
     } catch (error) {

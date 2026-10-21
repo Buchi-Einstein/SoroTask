@@ -4306,15 +4306,111 @@ impl SoroTaskContract {
         summary
     }
 
-    /// Fallible single-task execution used by [`Self::batch_execute`].
+    /// Enterprise batch multi-call dispatcher supporting independent tasks and atomic rollback pairs (#1415).
     ///
-    /// Returns `Ok(())` after the target call succeeds and keeper fees are
-    /// settled, or `Err(error_code)` on any recoverable failure. Never panics
-    /// for per-task outcomes so siblings can continue.
-    fn try_execute_isolated(env: &Env, keeper: &Address, task_id: u64) -> Result<(), u32> {
+    /// Up to 50 tasks can be packaged in a single transaction. Independent task failures
+    /// do not abort sibling operations, while paired atomic tasks rollback together in tandem
+    /// if either partner fails or reverts.
+    pub fn batch_execute_branches(
+        env: Env,
+        keeper: Address,
+        independent_task_ids: Vec<u64>,
+        atomic_pairs: Vec<batch::AtomicTaskPair>,
+    ) -> batch::BatchExecutionSummary {
+        enter_security_guard(&env);
+        keeper.require_auth();
+
+        let total_tasks = independent_task_ids.len() + (atomic_pairs.len() * 2);
+        if total_tasks == 0 || total_tasks > MAX_BATCH_SIZE as u32 {
+            panic_with_error!(&env, Error::InvalidInterval);
+        }
+
+        let mut outcomes: Vec<batch::BatchTaskOutcome> = Vec::new(&env);
+        let mut succeeded: u32 = 0;
+        let mut failed: u32 = 0;
+
+        // 1. Dispatch independent tasks with failure isolation
+        for i in 0..independent_task_ids.len() {
+            let task_id = independent_task_ids.get(i).unwrap();
+            match Self::try_execute_isolated(&env, &keeper, task_id) {
+                Ok(()) => {
+                    succeeded += 1;
+                    outcomes.push_back(batch::BatchTaskOutcome {
+                        task_id,
+                        succeeded: true,
+                        error_code: 0,
+                    });
+                    batch::publish_batch_task_event(&env, &keeper, task_id, true, 0);
+                }
+                Err(code) => {
+                    failed += 1;
+                    outcomes.push_back(batch::BatchTaskOutcome {
+                        task_id,
+                        succeeded: false,
+                        error_code: code,
+                    });
+                    batch::publish_batch_task_event(&env, &keeper, task_id, false, code);
+                }
+            }
+        }
+
+        // 2. Dispatch atomic paired tasks with tandem rollback
+        for i in 0..atomic_pairs.len() {
+            let pair = atomic_pairs.get(i).unwrap();
+            let (out_a, out_b) = Self::try_execute_atomic_pair(&env, &keeper, &pair);
+            if out_a.succeeded {
+                succeeded += 1;
+            } else {
+                failed += 1;
+            }
+            if out_b.succeeded {
+                succeeded += 1;
+            } else {
+                failed += 1;
+            }
+            outcomes.push_back(out_a);
+            outcomes.push_back(out_b);
+        }
+
+        let summary = batch::BatchExecutionSummary {
+            total: total_tasks as u32,
+            succeeded,
+            failed,
+            outcomes,
+        };
+        batch::publish_batch_summary_event(&env, &keeper, &summary);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "BatchExecutionCompleted"),
+                Symbol::new(&env, "v1"),
+                keeper.clone(),
+            ),
+            (summary.total, summary.succeeded, summary.failed),
+        );
+        exit_security_guard(&env);
+        summary
+    }
+
+    /// Dispatch a batch consisting strictly of atomic paired task branches (#1415).
+    pub fn batch_execute_atomic_pairs(
+        env: Env,
+        keeper: Address,
+        pairs: Vec<batch::AtomicTaskPair>,
+    ) -> batch::BatchExecutionSummary {
+        let empty_independent: Vec<u64> = Vec::new(&env);
+        Self::batch_execute_branches(env, keeper, empty_independent, pairs)
+    }
+
+    /// Precondition checks and target contract call for an isolated task without mutating storage (#1415).
+    fn prepare_and_invoke_isolated(
+        env: &Env,
+        keeper: &Address,
+        task_id: u64,
+    ) -> Result<(TaskConfig, i128), u32> {
         use events::{ExecutionStep, StepResult};
 
-        let mut config: TaskConfig = match batch::load_task_or_error(env, task_id) {
+        let config: TaskConfig = match batch::load_task_or_error(env, task_id) {
             Ok(cfg) => cfg,
             Err(err) => return Err(err as u32),
         };
@@ -4362,8 +4458,7 @@ impl SoroTaskContract {
             fee as u32,
         );
 
-        // Target call — isolated via try_invoke_contract so a revert does not
-        // abort sibling tasks (#1179).
+        // Target call — isolated via try_invoke_contract so a revert does not abort siblings.
         let invoke_result =
             batch::try_invoke_target(env, &config.target, &config.function, config.args.clone());
         if let Err(code) = invoke_result {
@@ -4387,7 +4482,18 @@ impl SoroTaskContract {
             0,
         );
 
-        // Settle fees only for successful executions.
+        Ok((config, fee))
+    }
+
+    /// Commit task state changes, deduct fee, and settle keeper payouts upon verified invocation (#1415).
+    fn commit_executed_task(
+        env: &Env,
+        keeper: &Address,
+        task_id: u64,
+        mut config: TaskConfig,
+        fee: i128,
+    ) {
+        let now = env.ledger().timestamp();
         let protocol_fee_bps: u32 = env
             .storage()
             .instance()
@@ -4435,7 +4541,6 @@ impl SoroTaskContract {
             assert_balance_invariant(env);
         }
 
-        // Update state on success only.
         config.last_run = now;
         save_task(env, task_id, &config);
         storage::record_successful_run(env, task_id, config.last_run);
@@ -4449,7 +4554,116 @@ impl SoroTaskContract {
             .persistent()
             .remove(&DataKey::VrfKeeperAssignment(task_id));
         Self::set_task_status(env, task_id, ExecutionOutcome::Success);
+    }
 
+    /// Executes a paired atomic task branch (#1415).
+    /// Both tasks must pass preconditions and their target invocations must succeed;
+    /// if either fails, neither commits in storage and both are marked failed/rolled back.
+    fn try_execute_atomic_pair(
+        env: &Env,
+        keeper: &Address,
+        pair: &batch::AtomicTaskPair,
+    ) -> (batch::BatchTaskOutcome, batch::BatchTaskOutcome) {
+        let res_a = Self::prepare_and_invoke_isolated(env, keeper, pair.task_a);
+        let res_b = Self::prepare_and_invoke_isolated(env, keeper, pair.task_b);
+
+        match (res_a, res_b) {
+            (Ok((cfg_a, fee_a)), Ok((cfg_b, fee_b))) => {
+                Self::commit_executed_task(env, keeper, pair.task_a, cfg_a, fee_a);
+                Self::commit_executed_task(env, keeper, pair.task_b, cfg_b, fee_b);
+
+                batch::publish_batch_task_event(env, keeper, pair.task_a, true, 0);
+                batch::publish_batch_task_event(env, keeper, pair.task_b, true, 0);
+
+                (
+                    batch::BatchTaskOutcome {
+                        task_id: pair.task_a,
+                        succeeded: true,
+                        error_code: 0,
+                    },
+                    batch::BatchTaskOutcome {
+                        task_id: pair.task_b,
+                        succeeded: true,
+                        error_code: 0,
+                    },
+                )
+            }
+            (Err(err_a), Ok(_)) => {
+                // Partner B is rolled back because A failed
+                batch::publish_batch_task_event(env, keeper, pair.task_a, false, err_a);
+                batch::publish_batch_task_event(
+                    env,
+                    keeper,
+                    pair.task_b,
+                    false,
+                    batch::ATOMIC_PAIR_PARTNER_FAILED,
+                );
+
+                (
+                    batch::BatchTaskOutcome {
+                        task_id: pair.task_a,
+                        succeeded: false,
+                        error_code: err_a,
+                    },
+                    batch::BatchTaskOutcome {
+                        task_id: pair.task_b,
+                        succeeded: false,
+                        error_code: batch::ATOMIC_PAIR_PARTNER_FAILED,
+                    },
+                )
+            }
+            (Ok(_), Err(err_b)) => {
+                // Partner A is rolled back because B failed
+                batch::publish_batch_task_event(
+                    env,
+                    keeper,
+                    pair.task_a,
+                    false,
+                    batch::ATOMIC_PAIR_PARTNER_FAILED,
+                );
+                batch::publish_batch_task_event(env, keeper, pair.task_b, false, err_b);
+
+                (
+                    batch::BatchTaskOutcome {
+                        task_id: pair.task_a,
+                        succeeded: false,
+                        error_code: batch::ATOMIC_PAIR_PARTNER_FAILED,
+                    },
+                    batch::BatchTaskOutcome {
+                        task_id: pair.task_b,
+                        succeeded: false,
+                        error_code: err_b,
+                    },
+                )
+            }
+            (Err(err_a), Err(err_b)) => {
+                batch::publish_batch_task_event(env, keeper, pair.task_a, false, err_a);
+                batch::publish_batch_task_event(env, keeper, pair.task_b, false, err_b);
+
+                (
+                    batch::BatchTaskOutcome {
+                        task_id: pair.task_a,
+                        succeeded: false,
+                        error_code: err_a,
+                    },
+                    batch::BatchTaskOutcome {
+                        task_id: pair.task_b,
+                        succeeded: false,
+                        error_code: err_b,
+                    },
+                )
+            }
+        }
+    }
+
+    /// Fallible single-task execution used by [`Self::batch_execute`].
+    ///
+    /// Returns `Ok(())` after the target call succeeds and keeper fees are
+    /// settled, or `Err(error_code)` on any recoverable failure. Never panics
+    /// for per-task outcomes so siblings can continue.
+    fn try_execute_isolated(env: &Env, keeper: &Address, task_id: u64) -> Result<(), u32> {
+        let (config, fee) = Self::prepare_and_invoke_isolated(env, keeper, task_id)?;
+        Self::commit_executed_task(env, keeper, task_id, config, fee);
         Ok(())
     }
 

@@ -8,9 +8,12 @@ pub mod packed_args;
 pub mod rate_limiter;
 pub use events::*;
 pub mod admin;
+pub mod circuit_breaker;
 pub mod dag;
+pub mod dynamic_nft;
 pub mod math;
 pub mod optimistic;
+pub mod private_tasks;
 pub mod state_channel;
 pub mod storage;
 pub mod task;
@@ -168,6 +171,30 @@ pub enum Error {
     ChannelNotClosing = 816,
     InvalidChannelParticipants = 817,
     ChannelNotClosed = 818,
+    // Emergency circuit breaker errors (SC-PROD-32)
+    BreakerInvalidConfig = 900,
+    BreakerAlreadyEngaged = 901,
+    BreakerNotEngaged = 902,
+    BreakerCooldownActive = 903,
+    BreakerRenewalLimit = 904,
+    BreakerInvalidFixProof = 905,
+    BreakerAlreadyVoted = 906,
+    BreakerVoterIneligible = 907,
+    BreakerStakeLocked = 908,
+    // Privacy-preserving scheduler errors (SC-PROD-31)
+    InvalidPrivateTaskConfig = 920,
+    InvalidPrivateCommitment = 921,
+    PrivateCommitmentExists = 922,
+    PrivateTreeFull = 923,
+    PrivateUnknownRoot = 924,
+    PrivateNullifierSpent = 925,
+    PrivateProofStale = 926,
+    // Dynamic NFT evolution errors (SC-PROD-30)
+    InvalidNftTiers = 940,
+    NftCollectionNotFound = 941,
+    // Congestion surcharge errors (SC-PROD-29)
+    InvalidSurchargeConfig = 960,
+    InvalidInclusionFee = 961,
 }
 
 #[contracttype]
@@ -1793,17 +1820,23 @@ pub(crate) fn assert_balance_invariant(env: &Env) {
         let total_keeper_stakes = get_total_keeper_stakes(env);
         let total_unclaimed_fees = get_total_unclaimed_fees(env);
         let insurance_reserve = insurance::funded_balance(env);
+        let private_pool = private_tasks::pool_balance(env);
+        let required = total_task_escrows
+            + total_keeper_stakes
+            + total_unclaimed_fees
+            + insurance_reserve
+            + private_pool;
         assert!(
-            contract_balance.saturating_add(total_invested_task_escrows)
-                >= total_task_escrows + total_keeper_stakes + total_unclaimed_fees + insurance_reserve,
-            "Total balance invariant violated: liquid plus invested balance {} is less than required sum {} (escrows: {}, invested: {}, stakes: {}, unclaimed: {}, insurance: {})",
+            contract_balance.saturating_add(total_invested_task_escrows) >= required,
+            "Total balance invariant violated: liquid plus invested balance {} is less than required sum {} (escrows: {}, invested: {}, stakes: {}, unclaimed: {}, insurance: {}, private pool: {})",
             contract_balance.saturating_add(total_invested_task_escrows),
-            total_task_escrows + total_keeper_stakes + total_unclaimed_fees + insurance_reserve,
+            required,
             total_task_escrows,
             total_invested_task_escrows,
             total_keeper_stakes,
             total_unclaimed_fees,
-            insurance_reserve
+            insurance_reserve,
+            private_pool
         );
     }
 }
@@ -2376,6 +2409,9 @@ impl SoroTaskContract {
     }
 
     pub fn is_protocol_paused(env: Env) -> bool {
+        if circuit_breaker::is_engaged(&env) {
+            return true;
+        }
         if let Some(mut state) = env
             .storage()
             .persistent()
@@ -2611,6 +2647,216 @@ impl SoroTaskContract {
             ),
             (config.creator.clone(), amount),
         );
+    }
+
+    // ── Emergency circuit breaker (SC-PROD-32) ─────────────────────────────
+
+    /// Appoints the security committee that can trip the circuit breaker.
+    /// `threshold` approvals are needed to renew or lift a pause, and
+    /// `veto_quorum_bps` of staked supply is needed for a community veto.
+    pub fn set_security_committee(
+        env: Env,
+        admin: Address,
+        members: Vec<Address>,
+        threshold: u32,
+        veto_quorum_bps: u32,
+    ) {
+        circuit_breaker::set_committee(&env, &admin, members, threshold, veto_quorum_bps);
+    }
+
+    pub fn get_security_committee(env: Env) -> Option<circuit_breaker::SecurityCommittee> {
+        circuit_breaker::committee(&env)
+    }
+
+    /// Instantly pauses task execution for 72 hours. Any single committee
+    /// member may call this during an active exploit.
+    pub fn trip_circuit_breaker(
+        env: Env,
+        member: Address,
+        incident_hash: BytesN<32>,
+    ) -> circuit_breaker::BreakerState {
+        circuit_breaker::trip(&env, &member, incident_hash)
+    }
+
+    /// Adds a committee approval to renew (with a bug-fix proof) or lift the
+    /// active pause. Returns `true` once the K-of-N quorum executes it.
+    pub fn approve_breaker_action(
+        env: Env,
+        member: Address,
+        action: circuit_breaker::BreakerAction,
+    ) -> bool {
+        circuit_breaker::approve(&env, &member, action)
+    }
+
+    /// Votes staked balance to veto or uphold the active pause. Returns
+    /// `true` if this vote reached quorum and lifted the pause.
+    pub fn cast_breaker_veto(env: Env, voter: Address, veto: bool) -> bool {
+        circuit_breaker::cast_vote(&env, &voter, veto)
+    }
+
+    pub fn get_circuit_breaker_state(env: Env) -> circuit_breaker::BreakerState {
+        circuit_breaker::current_state(&env)
+    }
+
+    pub fn is_circuit_breaker_engaged(env: Env) -> bool {
+        circuit_breaker::is_engaged(&env)
+    }
+
+    // ── Privacy-preserving scheduler (SC-PROD-31) ──────────────────────────
+
+    /// One-time setup of the Groth16 verifying key and pool denomination.
+    pub fn configure_private_scheduler(
+        env: Env,
+        admin: Address,
+        vk: private_tasks::PrivateVerifyingKey,
+        denomination: i128,
+    ) {
+        private_tasks::configure(&env, &admin, vk, denomination);
+    }
+
+    /// Registers a blinded Pedersen task commitment, escrowing one
+    /// denomination. Returns the commitment's Merkle leaf index.
+    pub fn register_private_task(
+        env: Env,
+        funder: Address,
+        commitment: soroban_sdk::crypto::bls12_381::G1Affine,
+    ) -> u32 {
+        private_tasks::register(&env, &funder, commitment)
+    }
+
+    /// Executes a private task by proving possession of an unspent commitment
+    /// whose criteria are met, without revealing which one or who created it.
+    pub fn execute_private_task(
+        env: Env,
+        keeper: Address,
+        proof: private_tasks::PrivateProof,
+        inputs: private_tasks::PrivateExecutionInputs,
+        target: Address,
+        function: Symbol,
+        args: Vec<Val>,
+    ) -> Val {
+        if Self::is_protocol_paused(env.clone()) {
+            panic_with_error!(&env, Error::TaskPaused);
+        }
+        private_tasks::execute(&env, &keeper, proof, inputs, target, function, args)
+    }
+
+    pub fn get_private_task_root(env: Env) -> BytesN<32> {
+        private_tasks::current_root(&env)
+    }
+
+    pub fn is_private_task_root_known(env: Env, root: BytesN<32>) -> bool {
+        private_tasks::is_known_root(&env, &root)
+    }
+
+    pub fn is_private_nullifier_spent(env: Env, nullifier: BytesN<32>) -> bool {
+        private_tasks::is_nullifier_spent(&env, nullifier)
+    }
+
+    pub fn get_private_commitment(
+        env: Env,
+        leaf: BytesN<32>,
+    ) -> Option<private_tasks::PrivateCommitmentRecord> {
+        private_tasks::get_commitment(&env, leaf)
+    }
+
+    pub fn get_private_task_count(env: Env) -> u32 {
+        private_tasks::commitment_count(&env)
+    }
+
+    pub fn get_pedersen_generators(
+        env: Env,
+    ) -> (
+        soroban_sdk::crypto::bls12_381::G1Affine,
+        soroban_sdk::crypto::bls12_381::G1Affine,
+    ) {
+        private_tasks::generators(&env)
+    }
+
+    // ── Dynamic NFT evolution (SC-PROD-30) ─────────────────────────────────
+
+    /// Registers or replaces a collection's tier rules. Must be authorized by
+    /// the NFT contract itself.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_dynamic_nft_collection(
+        env: Env,
+        nft_contract: Address,
+        update_fn: Symbol,
+        metrics_source: Address,
+        metrics_fn: Symbol,
+        base_uri: soroban_sdk::String,
+        tiers: Vec<dynamic_nft::NftTier>,
+        allow_downgrade: bool,
+    ) {
+        dynamic_nft::register_collection(
+            &env,
+            nft_contract,
+            update_fn,
+            metrics_source,
+            metrics_fn,
+            base_uri,
+            tiers,
+            allow_downgrade,
+        );
+    }
+
+    /// Keeper entry point: re-reads a token's DeFi metrics and evolves its
+    /// metadata when it crosses a tier threshold.
+    pub fn evolve_dynamic_nft(
+        env: Env,
+        keeper: Address,
+        nft_contract: Address,
+        token_id: u32,
+    ) -> bool {
+        if Self::is_protocol_paused(env.clone()) {
+            panic_with_error!(&env, Error::TaskPaused);
+        }
+        dynamic_nft::evolve(&env, &keeper, nft_contract, token_id)
+    }
+
+    pub fn get_dynamic_nft_collection(
+        env: Env,
+        nft_contract: Address,
+    ) -> Option<dynamic_nft::DynamicNftCollection> {
+        dynamic_nft::get_collection(&env, nft_contract)
+    }
+
+    pub fn get_dynamic_nft_attributes(
+        env: Env,
+        nft_contract: Address,
+        token_id: u32,
+    ) -> Option<dynamic_nft::DynamicNftAttributes> {
+        dynamic_nft::get_attributes(&env, nft_contract, token_id)
+    }
+
+    // ── Congestion surcharge (SC-PROD-29) ──────────────────────────────────
+
+    /// Fee reporters (admin or ROLE_FEES delegates) publish observed network
+    /// inclusion fees, feeding the 24h median baseline.
+    pub fn record_inclusion_fee(env: Env, reporter: Address, fee: i128) {
+        gas::record_inclusion_fee(&env, &reporter, fee);
+    }
+
+    pub fn set_surcharge_config(env: Env, caller: Address, config: gas::SurchargeConfig) {
+        gas::set_surcharge_config(&env, &caller, config);
+    }
+
+    pub fn get_surcharge_config(env: Env) -> gas::SurchargeConfig {
+        gas::surcharge_config(&env)
+    }
+
+    /// Declares the inclusion fee a keeper bids per execution transaction.
+    pub fn set_keeper_fee_bid(env: Env, keeper: Address, bid: i128) {
+        gas::set_keeper_fee_bid(&env, &keeper, bid);
+    }
+
+    pub fn get_baseline_inclusion_fee(env: Env) -> Option<i128> {
+        gas::baseline_inclusion_fee(&env)
+    }
+
+    /// Previews the surcharge and overbid penalty `keeper` would get now.
+    pub fn quote_congestion_surcharge(env: Env, keeper: Address) -> gas::CongestionQuote {
+        gas::quote_congestion(&env, Some(&keeper))
     }
 
     /// Validates task payload arguments for size and structure.
@@ -4711,7 +4957,7 @@ impl SoroTaskContract {
 
         // ── Gas Meter: Initialize for dynamic fee calculation ──────────────────
         // Pass task interval for base fee computation (shorter interval = higher base fee)
-        let gas_meter = gas::GasMeter::new(env, config.interval);
+        let gas_meter = gas::GasMeter::for_keeper(env, config.interval, Some(keeper));
 
         // ── 3. Check invalidation hooks (Issue #832) ────────────────────
         if let Some(hook) = check_invalidation_hooks(env, &config.target) {
@@ -8706,6 +8952,7 @@ impl SoroTaskContract {
         if amount <= 0 {
             panic_with_error!(&env, Error::InsufficientBalance);
         }
+        circuit_breaker::note_stake_increase(&env, &staker);
 
         // Validate staking pool is initialized
         let pool: StakingPool = env
@@ -8827,6 +9074,7 @@ impl SoroTaskContract {
     pub fn unstake_tokens(env: Env, staker: Address, amount: i128) {
         enter_security_guard(&env);
         staker.require_auth();
+        circuit_breaker::assert_stake_unlocked(&env, &staker);
 
         // Validate staking pool is initialized
         let pool: StakingPool = env

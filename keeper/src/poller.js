@@ -7,6 +7,7 @@ const { TaskFilterChain } = require('./taskFilter');
 const { SimulationCache } = require('./simulationCache');
 const { TaskMetadataCache } = require('./taskMetadataCache');
 const { ReadBatcher } = require('./readBatcher');
+const { TaskReadinessPredictor } = require('./ml-execution-predictor');
 const crypto = require('crypto');
 
 function normalizeLogger(logger) {
@@ -49,6 +50,7 @@ class TaskPoller {
     this.resolverRuntime = options.resolverRuntime || null;
     this.oracleAggregator = options.oracleAggregator || null;
     this.fraudDetection = options.fraudDetection || null;
+    this.readinessPredictor = options.readinessPredictor || new TaskReadinessPredictor({ logger: this.logger });
     this.resolverFailureMode = options.resolverFailureMode || process.env.RESOLVER_FAILURE_MODE || 'skip';
     this.shardLabel = options.shardLabel || null;
     this.driftWarningSeconds = parseInt(
@@ -713,6 +715,15 @@ class TaskPoller {
         }
       }
 
+      // #1429 — Predictive task readiness ML model ahead of block close
+      let readinessPrediction = null;
+      if (this.readinessPredictor) {
+        readinessPrediction = this.readinessPredictor.predictReadiness(taskConfig, {
+          timestamp: currentTimestamp,
+          sequence: this.lastObservedLedger || 1000,
+        });
+      }
+
       return {
         isDue,
         taskId,
@@ -729,6 +740,7 @@ class TaskPoller {
         resolver,
         oracle: oracleEvaluation,
         anomaly: anomalyEvaluation,
+        readiness: readinessPrediction,
       };
 
     } catch (error) {

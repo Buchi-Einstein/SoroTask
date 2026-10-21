@@ -1,6 +1,7 @@
 const { Keypair, rpc, Networks, StrKey } = require('@stellar/stellar-sdk');
 const { Server } = rpc;
 const { createLogger } = require('./logger');
+const { AdaptiveGasTracker, getAdaptiveGasTracker } = require('./gasTracker');
 
 // Create logger for account module
 const logger = createLogger('account');
@@ -370,7 +371,8 @@ async function initializeKeeperAccount(opts = {}) {
     const rpcUrl = process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org';
     const server = new Server(rpcUrl, { allowHttp: rpcUrl.startsWith('http://') });
     const accountResponse = await server.getAccount(publicKey);
-    return { keypair, accountResponse, hsmSigner };
+    const gasTracker = opts.gasTracker || getAdaptiveGasTracker();
+    return { keypair, accountResponse, hsmSigner, gasTracker };
   }
 
   // Local signer mode: load the secret from the configured provider.
@@ -385,7 +387,27 @@ async function initializeKeeperAccount(opts = {}) {
   const rpcUrl = process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org';
   const server = new Server(rpcUrl, { allowHttp: rpcUrl.startsWith('http://') });
   const accountResponse = await server.getAccount(publicKey);
-  return { keypair, accountResponse };
+  const gasTracker = opts.gasTracker || getAdaptiveGasTracker();
+  return { keypair, accountResponse, gasTracker };
+}
+
+/**
+ * Forecast the optimal inclusion fee 3 ledgers in advance for transactions signed by the keeper account (#1439).
+ * @param {object} [options]
+ * @returns {object}
+ */
+function forecastAccountInclusionFee(options = {}) {
+  const tracker = options.gasTracker || getAdaptiveGasTracker();
+  return tracker.forecastInclusionFee(options);
+}
+
+/**
+ * Record a ledger fee observation on the keeper account's adaptive gas tracker (#1439).
+ * @param {object|number} sample
+ * @param {AdaptiveGasTracker} [tracker]
+ */
+function recordAccountLedgerFee(sample, tracker = getAdaptiveGasTracker()) {
+  return tracker.recordLedgerSample(sample);
 }
 
 module.exports = {
@@ -399,4 +421,8 @@ module.exports = {
   fetchSecretFromVault,
   fetchSecretFromAWS,
   clearSecretMemory,
+  AdaptiveGasTracker,
+  getAdaptiveGasTracker,
+  forecastAccountInclusionFee,
+  recordAccountLedgerFee,
 };

@@ -427,7 +427,12 @@ class ExecutionQueue extends EventEmitter {
     this.failedTasks = new Set();
     this.retryTaskIds = new Set();
     this.shuttingDown = false;
+    this.drainingForReload = false;
     this.taskDueInfo = new Map();
+    // #1436 — Track active distributed locks and signal handlers for zero-downtime draining
+    this.activeLocks = new Map();
+    this.pendingTaskBuffer = [];
+    this._signalHandlers = new Map();
   }
 
   async initialize() {
@@ -478,6 +483,16 @@ class ExecutionQueue extends EventEmitter {
   }
 
   async enqueue(tasksToEnqueue, executorFn, taskConfigMap = {}) {
+    if (this.drainingForReload) {
+      if (Array.isArray(tasksToEnqueue) && tasksToEnqueue.length > 0) {
+        this.pendingTaskBuffer.push(...tasksToEnqueue);
+      }
+      this.logger.info('Queue is draining for hot reload, buffering tasks for replacement worker', {
+        bufferedCount: Array.isArray(tasksToEnqueue) ? tasksToEnqueue.length : 0,
+      });
+      return;
+    }
+
     if (this.shuttingDown) {
       this.logger.warn('Queue is shutting down, rejecting new execution batch', {
         taskCount: Array.isArray(tasksToEnqueue) ? tasksToEnqueue.length : 0,
@@ -593,6 +608,7 @@ class ExecutionQueue extends EventEmitter {
                 attemptContext.fencingToken = distributedLockToken.fencingToken;
                 attemptContext.lockToken = distributedLockToken.token;
               }
+              this.activeLocks.set(String(taskId), distributedLockToken);
               this.emit('task:lock-acquired', taskId, distributedLockToken);
             }
 
@@ -680,6 +696,7 @@ class ExecutionQueue extends EventEmitter {
             if (distributedLockToken) {
               try {
                 await releaseLock(taskId, distributedLockToken);
+                this.activeLocks.delete(String(taskId));
                 this.emit('task:lock-released', taskId, distributedLockToken);
               } catch (err) {
                 this.logger.error('Error releasing lock', { taskId, error: err.message });
@@ -817,6 +834,7 @@ class ExecutionQueue extends EventEmitter {
               attemptContext.fencingToken = distributedLockToken.fencingToken;
               attemptContext.lockToken = distributedLockToken.token;
             }
+            this.activeLocks.set(String(taskId), distributedLockToken);
             this.emit('task:lock-acquired', taskId, distributedLockToken);
           }
 
@@ -877,6 +895,7 @@ class ExecutionQueue extends EventEmitter {
           if (distributedLockToken) {
             try {
               await releaseLock(taskId, distributedLockToken);
+              this.activeLocks.delete(String(taskId));
               this.emit('task:lock-released', taskId, distributedLockToken);
             } catch (err) {
               this.logger.error('Error releasing lock', { taskId, error: err.message });
@@ -929,6 +948,99 @@ class ExecutionQueue extends EventEmitter {
     return this.gracefulShutdown(options);
   }
 
+  /**
+   * Release all currently held distributed locks cleanly (#1436).
+   * @returns {Promise<{ releasedCount: number, taskIds: string[] }>}
+   */
+  async releaseActiveLocks() {
+    const releasedTaskIds = [];
+    for (const [taskId, token] of Array.from(this.activeLocks.entries())) {
+      try {
+        await releaseLock(taskId, token);
+        this.activeLocks.delete(taskId);
+        releasedTaskIds.push(taskId);
+        this.emit('task:lock-released', taskId, token);
+      } catch (err) {
+        this.logger.error('Error releasing lock during drain', { taskId, error: err.message });
+      }
+    }
+    return {
+      releasedCount: releasedTaskIds.length,
+      taskIds: releasedTaskIds,
+    };
+  }
+
+  /**
+   * Register SIGTERM and SIGINT handlers for graceful worker draining (#1436).
+   * @param {object} [options]
+   * @param {number} [options.drainTimeoutMs=10000]
+   * @param {Function} [options.onSignal]
+   */
+  registerSignalHandlers(options = {}) {
+    const drainTimeoutMs = parseInt(
+      options.drainTimeoutMs || process.env.SHUTDOWN_DRAIN_TIMEOUT_MS || 10000,
+      10
+    );
+    const signals = options.signals || ['SIGTERM', 'SIGINT'];
+
+    this.unregisterSignalHandlers();
+
+    for (const sig of signals) {
+      const handler = async () => {
+        this.logger.info(`Received ${sig}, draining execution queue`, { signal: sig, drainTimeoutMs });
+        this.emit('signal:received', { signal: sig });
+        if (typeof options.onSignal === 'function') {
+          await options.onSignal(sig);
+        }
+        await this.gracefulShutdown({ drainTimeoutMs });
+      };
+      process.on(sig, handler);
+      this._signalHandlers.set(sig, handler);
+    }
+
+    return Array.from(this._signalHandlers.keys());
+  }
+
+  /**
+   * Remove registered process signal handlers (#1436).
+   */
+  unregisterSignalHandlers() {
+    for (const [sig, handler] of this._signalHandlers.entries()) {
+      process.removeListener(sig, handler);
+    }
+    this._signalHandlers.clear();
+  }
+
+  /**
+   * Drain in-flight work for a zero-downtime hot code reload without dropping queued tasks (#1436).
+   * @param {object} [options]
+   * @param {number} [options.drainTimeoutMs=30000]
+   * @returns {Promise<object>}
+   */
+  async prepareForHotReload(options = {}) {
+    const drainTimeoutMs = parseInt(
+      options.drainTimeoutMs || process.env.HOT_RELOAD_DRAIN_TIMEOUT_MS || 30000,
+      10
+    );
+    this.drainingForReload = true;
+    const handoffTasks = [...this.pendingTaskBuffer];
+    this.pendingTaskBuffer = [];
+
+    const summary = await this.gracefulShutdown({
+      drainTimeoutMs,
+      preserveQueued: Boolean(options.preserveQueued),
+    });
+
+    const lockRelease = await this.releaseActiveLocks();
+
+    return {
+      ...summary,
+      handoffTasks,
+      locksReleased: lockRelease.releasedCount,
+      releasedLockTaskIds: lockRelease.taskIds,
+    };
+  }
+
   async gracefulShutdown(options = {}) {
     const drainTimeoutMs = parseInt(
       options.drainTimeoutMs || process.env.SHUTDOWN_DRAIN_TIMEOUT_MS || 30000,
@@ -946,8 +1058,10 @@ class ExecutionQueue extends EventEmitter {
     });
 
     this.shuttingDown = true;
-    this.limit.clearQueue();
-    this.depth = 0;
+    if (!options.preserveQueued) {
+      this.limit.clearQueue();
+      this.depth = 0;
+    }
 
     onProgress({ phase: 'clearing-queue', remaining: this.inFlight });
 
@@ -957,7 +1071,7 @@ class ExecutionQueue extends EventEmitter {
           await Promise.allSettled(this.activePromises);
         }
         while (this.inFlight > 0) {
-          await new Promise((r) => setTimeout(r, 50));
+          await new Promise((r) => setTimeout(r, 25));
           onProgress({ phase: 'draining', remaining: this.inFlight });
         }
         return true;
@@ -975,6 +1089,7 @@ class ExecutionQueue extends EventEmitter {
       }),
     ]);
 
+    const lockRelease = await this.releaseActiveLocks();
     const durationMs = Date.now() - startTime;
     const summary = {
       drained,
@@ -983,6 +1098,7 @@ class ExecutionQueue extends EventEmitter {
       durationMs,
       completedCount: this.completed,
       failedCount: this.failedCount,
+      locksReleased: lockRelease.releasedCount,
     };
 
     if (drained) {
@@ -1023,6 +1139,7 @@ class ExecutionQueue extends EventEmitter {
 
   async shutdown() {
     this.shuttingDown = true;
+    this.unregisterSignalHandlers();
     this.logger.info('Shutting down execution queue');
 
     await this.gracefulShutdown();

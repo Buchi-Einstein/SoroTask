@@ -4,6 +4,7 @@
  */
 
 const crypto = require('crypto');
+const { getSignatureVerifier } = require('../crypto/signatureVerifier');
 
 /**
  * Message types in the consensus protocol
@@ -253,6 +254,60 @@ function verifyPeerIdentity(ed25519PublicKey, signature, challenge, allowedKeys)
   }
 }
 
+/**
+ * Batch verify consensus messages across peers using accelerated signature verifier (#1446)
+ * @param {Array<{ message: Object, secret?: string, publicKey?: any }>} messageItems
+ * @param {Object} [options]
+ * @returns {{ valid: boolean[], allValid: boolean, failedIndices: number[] }}
+ */
+function batchVerifyConsensusMessages(messageItems, options = {}) {
+  if (!Array.isArray(messageItems)) {
+    return { valid: [], allValid: true, failedIndices: [] };
+  }
+  const verifier = (options && options.verifier) || getSignatureVerifier();
+  const valid = new Array(messageItems.length);
+  const failedIndices = [];
+
+  const ed25519Batch = [];
+  const ed25519Indices = [];
+
+  for (let i = 0; i < messageItems.length; i++) {
+    const item = messageItems[i];
+    if (item.secret) {
+      const ok = verifySignature(item.message, item.secret);
+      valid[i] = ok;
+      if (!ok) failedIndices.push(i);
+    } else if (item.publicKey) {
+      const { signature, ...unsigned } = item.message;
+      ed25519Batch.push({
+        message: Buffer.from(JSON.stringify(unsigned)),
+        signature: Buffer.isBuffer(signature) ? signature : Buffer.from(signature, 'hex'),
+        publicKey: item.publicKey,
+      });
+      ed25519Indices.push(i);
+    } else {
+      valid[i] = false;
+      failedIndices.push(i);
+    }
+  }
+
+  if (ed25519Batch.length > 0) {
+    const edResult = verifier.batchVerifyEd25519(ed25519Batch);
+    for (let k = 0; k < ed25519Indices.length; k++) {
+      const originalIdx = ed25519Indices[k];
+      const ok = edResult.valid[k];
+      valid[originalIdx] = ok;
+      if (!ok) failedIndices.push(originalIdx);
+    }
+  }
+
+  return {
+    valid,
+    allValid: failedIndices.length === 0,
+    failedIndices,
+  };
+}
+
 module.exports = {
   MESSAGE_TYPES,
   createMessage,
@@ -265,4 +320,6 @@ module.exports = {
   createNoiseEncryptedEnvelope,
   decryptNoiseEnvelope,
   verifyPeerIdentity,
+  batchVerifyConsensusMessages,
+  getSignatureVerifier,
 };

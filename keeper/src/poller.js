@@ -39,6 +39,22 @@ class TaskPoller {
     // Structured logger for poller module
     this.logger = normalizeLogger(options.logger);
 
+    // Issue #1472: Hot-reloadable operational parameters
+    this.gasThreshold = parseInt(
+      options.gasThreshold !== undefined ? options.gasThreshold : (this.config?.gasThreshold || this.config?.minGasThreshold || process.env.GAS_THRESHOLD || 0),
+      10,
+    );
+    this.rpcUrl = options.rpcUrl || (this.config?.rpcUrl) || process.env.SOROBAN_RPC_URL || null;
+    this.logLevel = options.logLevel || (this.config?.logLevel) || process.env.LOG_LEVEL || 'info';
+    this.pollIntervalMs = parseInt(
+      options.pollIntervalMs !== undefined ? options.pollIntervalMs : (this.config?.pollIntervalMs || process.env.POLLING_INTERVAL_MS || 10000),
+      10,
+    );
+    this.consulService = options.consulService || this.config?.consulService || null;
+    if (this.consulService && typeof this.consulService.subscribe === 'function') {
+      this.consulUnsubscribe = this.consulService.subscribe((changes) => this.hotReload(changes));
+    }
+
     // Optional pre-filter chain — eliminates non-actionable tasks before RPC calls
     this.filterChain = options.filterChain instanceof TaskFilterChain
       ? options.filterChain
@@ -492,6 +508,87 @@ class TaskPoller {
    * @param {Object} [options] - Additional options including correlationId
    * @returns {Promise<{isDue: boolean, taskId: number, reason?: string, correlationId?: string}>}
    */
+
+  /**
+   * Dynamic hot-reloading of keeper gas thresholds, RPC endpoints, and log levels
+   * without restarting active Node.js processes.
+   * Issue #1472.
+   *
+   * @param {Object} changes - Dynamic configuration changes
+   * @returns {Object} Hot-reload result
+   */
+  hotReload(changes) {
+    if (!changes || typeof changes !== 'object') {
+      return { applied: false, reason: 'invalid_changes' };
+    }
+
+    const appliedChanges = {};
+
+    // 1. Hot-reload gas thresholds
+    if (changes.gasThreshold !== undefined || changes.minGasThreshold !== undefined) {
+      const newGas = Number(changes.gasThreshold ?? changes.minGasThreshold);
+      if (Number.isFinite(newGas) && newGas >= 0) {
+        const old = this.gasThreshold;
+        this.gasThreshold = newGas;
+        appliedChanges.gasThreshold = { old, new: newGas };
+        this.logger.info('Hot-reloaded keeper gas threshold', { old, newGas });
+      }
+    }
+
+    // 2. Hot-reload RPC endpoints
+    if (changes.rpcUrl || (Array.isArray(changes.rpcUrls) && changes.rpcUrls.length > 0)) {
+      const newRpc = changes.rpcUrl || changes.rpcUrls[0];
+      if (typeof newRpc === 'string' && (newRpc.startsWith('http://') || newRpc.startsWith('https://'))) {
+        const old = this.rpcUrl;
+        this.rpcUrl = newRpc;
+        try {
+          const { rpc } = require('@stellar/stellar-sdk');
+          const Server = rpc?.Server;
+          if (Server) {
+            this.server = new Server(newRpc, { allowHttp: newRpc.startsWith('http://') });
+          }
+        } catch (_err) {
+          // ignore
+        }
+        appliedChanges.rpcUrl = { old, new: newRpc };
+        this.logger.info('Hot-reloaded keeper RPC endpoint', { old, newRpc });
+      }
+    }
+
+    // 3. Hot-reload log levels
+    if (changes.logLevel && typeof changes.logLevel === 'string') {
+      const validLevels = ['trace', 'debug', 'info', 'warn', 'error', 'fatal'];
+      const normalizedLevel = changes.logLevel.toLowerCase();
+      if (validLevels.includes(normalizedLevel)) {
+        const old = this.logLevel;
+        this.logLevel = normalizedLevel;
+        process.env.LOG_LEVEL = normalizedLevel;
+        appliedChanges.logLevel = { old, new: normalizedLevel };
+        this.logger.info('Hot-reloaded keeper log level', { old, newLogLevel: normalizedLevel });
+      }
+    }
+
+    // 4. Hot-reload polling frequencies
+    if (changes.pollIntervalMs !== undefined) {
+      const newInterval = parseInt(changes.pollIntervalMs, 10);
+      if (newInterval >= 100) {
+        const old = this.pollIntervalMs;
+        this.pollIntervalMs = newInterval;
+        appliedChanges.pollIntervalMs = { old, new: newInterval };
+        this.logger.info('Hot-reloaded keeper poll interval', { old, newInterval });
+      }
+    }
+
+    if (this.config) {
+      Object.assign(this.config, changes);
+    }
+
+    return {
+      applied: true,
+      appliedChanges,
+    };
+  }
+
   async checkTask(taskId, currentTimestamp, registry, options = {}) {
     const correlationId = options.correlationId;
     const taskLogger = correlationId 
@@ -573,7 +670,7 @@ class TaskPoller {
       }
 
       // Check gas balance
-      if (taskConfig.gas_balance <= 0) {
+      if (taskConfig.gas_balance <= (this.gasThreshold ?? 0)) {
         this.logger.warn('Task has insufficient gas balance', { taskId, gasBalance: taskConfig.gas_balance });
         return { isDue: false, taskId, reason: 'skipped', secondsUntilDue: null, nextRunTime: null };
         taskLogger.warn('Task has insufficient gas balance', { taskId, gasBalance: taskConfig.gas_balance });

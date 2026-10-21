@@ -9,7 +9,7 @@
  */
 
 const pino = require('pino');
-const { extractOrCreateTraceContext, formatTraceParent } = require('../../scripts/traceContext');
+const { extractOrCreateTraceContext, parseTraceParent } = require('../../scripts/traceContext');
 const { AuditLogger, getAuditLogger } = require('./auditLogger');
 
 const SENSITIVE_FIELDS = [
@@ -142,9 +142,35 @@ function createLogger(module) {
     childWithTrace: (correlationIdOrContext) => {
       let traceMeta = {};
       if (typeof correlationIdOrContext === 'string') {
-        traceMeta = { correlationId: correlationIdOrContext, trace_id: correlationIdOrContext };
+        const parsed = parseTraceParent(correlationIdOrContext);
+        if (parsed) {
+          traceMeta = {
+            traceparent: parsed.traceparent,
+            trace_id: parsed.traceId,
+            span_id: parsed.spanId,
+            correlationId: parsed.traceId,
+          };
+        } else {
+          traceMeta = { correlationId: correlationIdOrContext, trace_id: correlationIdOrContext };
+        }
       } else if (correlationIdOrContext && typeof correlationIdOrContext === 'object') {
-        traceMeta = correlationIdOrContext;
+        traceMeta = { ...correlationIdOrContext };
+        if (traceMeta.traceparent) {
+          const parsed = parseTraceParent(traceMeta.traceparent);
+          if (parsed) {
+            traceMeta.trace_id = traceMeta.trace_id || parsed.traceId;
+            traceMeta.span_id = traceMeta.span_id || parsed.spanId;
+          }
+        }
+        if (traceMeta.traceId && !traceMeta.trace_id) {
+          traceMeta.trace_id = traceMeta.traceId;
+        }
+        if (traceMeta.txHash && !traceMeta.tx_hash) {
+          traceMeta.tx_hash = traceMeta.txHash;
+        }
+        if (traceMeta.rpcCall && !traceMeta.rpc_call) {
+          traceMeta.rpc_call = traceMeta.rpcCall;
+        }
       }
       const traceChild = child.child(traceMeta);
       return createTracedLogger(traceChild, module);
@@ -179,9 +205,35 @@ function createTracedLogger(child, module) {
     childWithTrace: (correlationIdOrContext) => {
       let traceMeta = {};
       if (typeof correlationIdOrContext === 'string') {
-        traceMeta = { correlationId: correlationIdOrContext, trace_id: correlationIdOrContext };
+        const parsed = parseTraceParent(correlationIdOrContext);
+        if (parsed) {
+          traceMeta = {
+            traceparent: parsed.traceparent,
+            trace_id: parsed.traceId,
+            span_id: parsed.spanId,
+            correlationId: parsed.traceId,
+          };
+        } else {
+          traceMeta = { correlationId: correlationIdOrContext, trace_id: correlationIdOrContext };
+        }
       } else if (correlationIdOrContext && typeof correlationIdOrContext === 'object') {
-        traceMeta = correlationIdOrContext;
+        traceMeta = { ...correlationIdOrContext };
+        if (traceMeta.traceparent) {
+          const parsed = parseTraceParent(traceMeta.traceparent);
+          if (parsed) {
+            traceMeta.trace_id = traceMeta.trace_id || parsed.traceId;
+            traceMeta.span_id = traceMeta.span_id || parsed.spanId;
+          }
+        }
+        if (traceMeta.traceId && !traceMeta.trace_id) {
+          traceMeta.trace_id = traceMeta.traceId;
+        }
+        if (traceMeta.txHash && !traceMeta.tx_hash) {
+          traceMeta.tx_hash = traceMeta.txHash;
+        }
+        if (traceMeta.rpcCall && !traceMeta.rpc_call) {
+          traceMeta.rpc_call = traceMeta.rpcCall;
+        }
       }
       const traceChild = child.child(traceMeta);
       return createTracedLogger(traceChild, module);

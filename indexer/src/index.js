@@ -242,7 +242,14 @@ async function handleEvent(event) {
   // After storing event, reconcile this task to ensure state is correct
   if (taskId) {
     await reconcileTask(taskId);
-    cacheInvalidator.invalidateForEvent(name, taskId, JSON.parse(dataJson || '{}'));
+    const parsedData = JSON.parse(dataJson || '{}');
+    cacheInvalidator.invalidateForEvent(name, taskId, parsedData);
+    await cacheInvalidator.handleDatabaseMutation({
+      table: 'events',
+      operation: name,
+      taskId,
+      record: parsedData,
+    });
   }
 }
 
@@ -321,8 +328,17 @@ function upsertTask(task) {
       task.is_active ? 1 : 0,
       task.blocked_by_json || JSON.stringify([]),
       (err) => {
-        if (err) reject(err);
-        else resolve();
+        if (err) {
+          reject(err);
+        } else {
+          void cacheInvalidator.handleDatabaseMutation({
+            table: 'tasks',
+            operation: 'UPSERT',
+            taskId: task.task_id,
+            record: task,
+          });
+          resolve();
+        }
       }
     );
     stmt.finalize();
@@ -703,12 +719,66 @@ process.on("SIGINT", () => {
   });
 });
 
+const DEBEZIUM_CONNECTOR_CONFIG = {
+  name: 'postgres-cdc-keeper-connector',
+  config: {
+    'connector.class': 'io.debezium.connector.postgresql.PostgresConnector',
+    'plugin.name': 'pgoutput',
+    'database.hostname': process.env.PG_HOST || 'localhost',
+    'database.port': process.env.PG_PORT || '5432',
+    'database.user': process.env.PG_USER || 'postgres',
+    'database.password': process.env.PG_PASSWORD || 'postgres',
+    'database.dbname': process.env.PG_DATABASE || 'sorotask',
+    'database.server.name': 'sorotask_cdc',
+    'table.include.list': 'public.tasks,public.task_configs',
+    'tombstones.on.delete': 'false',
+    'decimal.handling.mode': 'double',
+  },
+};
+
+async function publishCDCMutation(producer, topic, mutationEvent) {
+  const afterRecord = mutationEvent?.payload?.after || null;
+  const beforeRecord = mutationEvent?.payload?.before || null;
+  const key = afterRecord?.id ?? afterRecord?.task_id ?? beforeRecord?.id ?? beforeRecord?.task_id ?? null;
+
+  await cacheInvalidator.handleDatabaseMutation({
+    table: mutationEvent?.payload?.source?.table || 'tasks',
+    operation: mutationEvent?.payload?.op || 'UPDATE',
+    taskId: key,
+    record: afterRecord || beforeRecord || {},
+  });
+
+  if (!producer || typeof producer.send !== 'function') return;
+  await producer.send({
+    topic: topic || process.env.KEEPER_CDC_TOPIC || 'sorotask.cdc.keeper.mutations',
+    messages: [
+      {
+        key: key !== null ? String(key) : null,
+        value: JSON.stringify(mutationEvent),
+      },
+    ],
+  });
+}
+
+function configureEdgeCdnRules(surrogateKeys = ['tasks:all'], options = {}) {
+  return cacheInvalidator.buildCdnCacheHeaders(surrogateKeys, options);
+}
+
+async function triggerEdgeCachePurge(surrogateKeys = []) {
+  return cacheInvalidator.purgeEdgeCache(surrogateKeys);
+}
+
 module.exports = {
   handleEvent,
   reconcileTask,
   reconcileAll,
   HighAvailabilityManager,
   CacheInvalidationEngine,
+  cacheInvalidator,
+  configureEdgeCdnRules,
+  triggerEdgeCachePurge,
   ParallelLedgerParser,
+  DEBEZIUM_CONNECTOR_CONFIG,
+  publishCDCMutation,
 };
 

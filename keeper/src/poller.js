@@ -3,10 +3,12 @@ const { createRateLimiter } = require('./concurrency');
 const { DistributedRateLimiter } = require('./distributedRateLimiter');
 const { createLogger } = require('./logger');
 const { validateTaskPayload } = require('./taskValidator');
+const { BytecodeScanner } = require('./bytecodeScanner');
 const { TaskFilterChain } = require('./taskFilter');
 const { SimulationCache } = require('./simulationCache');
 const { TaskMetadataCache } = require('./taskMetadataCache');
 const { ReadBatcher } = require('./readBatcher');
+const { TaskReadinessPredictor } = require('./ml-execution-predictor');
 const crypto = require('crypto');
 
 function normalizeLogger(logger) {
@@ -47,6 +49,10 @@ class TaskPoller {
     this.config = options.config || null;
     this.historyManager = options.historyManager || null;
     this.resolverRuntime = options.resolverRuntime || null;
+    this.oracleAggregator = options.oracleAggregator || null;
+    this.fraudDetection = options.fraudDetection || null;
+    this.readinessPredictor = options.readinessPredictor || new TaskReadinessPredictor({ logger: this.logger });
+    this.bytecodeScanner = options.bytecodeScanner || new BytecodeScanner(options);
     this.resolverFailureMode = options.resolverFailureMode || process.env.RESOLVER_FAILURE_MODE || 'skip';
     this.shardLabel = options.shardLabel || null;
     this.driftWarningSeconds = parseInt(
@@ -474,6 +480,10 @@ class TaskPoller {
       context.resolver = result.resolver;
     }
 
+    if (result.deps && Array.isArray(result.deps)) {
+      context.deps = result.deps;
+    }
+
     return {
       taskId: result.taskId,
       correlationId: result.correlationId,
@@ -563,8 +573,31 @@ class TaskPoller {
         registry.updateTask(taskId, { ...taskConfig, status: taskConfig.gas_balance > 0 ? 'active' : 'low_gas' });
       }
 
+      // Pre-poll bytecode safety scanner (#1447)
+      if (this.bytecodeScanner) {
+        if (this.bytecodeScanner.isBlacklisted(taskConfig.target)) {
+          this.logger.warn('Task target contract is blacklisted due to bytecode vulnerability', {
+            taskId,
+            target: taskConfig.target,
+          });
+          return { isDue: false, taskId, reason: 'contract_blacklisted', correlationId };
+        }
+
+        if (taskConfig.bytecode) {
+          const scanResult = this.bytecodeScanner.scan(taskConfig.bytecode, { contractId: taskConfig.target });
+          if (!scanResult.safe) {
+            taskLogger.warn('Task contract bytecode failed static analysis', {
+              taskId,
+              target: taskConfig.target,
+              vulnerabilities: scanResult.vulnerabilities,
+            });
+            return { isDue: false, taskId, reason: 'vulnerable_bytecode', correlationId };
+          }
+        }
+      }
+
       // Validate task payload size and shape
-      const validation = validateTaskPayload(taskConfig, taskConfig.args || []);
+      const validation = validateTaskPayload(taskConfig, taskConfig.args || [], { scanner: this.bytecodeScanner });
       if (!validation.isValid) {
         this.logger.error('Task rejected due to malformed payload', { taskId, errors: validation.errors.join(', ') });
         return { isDue: false, taskId, reason: 'invalid_payload' };
@@ -678,10 +711,53 @@ class TaskPoller {
         }
       }
 
+      // #1455 — Evaluate multi-source oracle price condition when configured
+      let oracleEvaluation = null;
+      if (isDue && this.oracleAggregator && (taskConfig.oracleCondition || taskConfig.oracle)) {
+        oracleEvaluation = await this.evaluateOracleGate(taskId, taskConfig, { taskLogger });
+        if (oracleEvaluation && !oracleEvaluation.isReady) {
+          isDue = false;
+          reason = oracleEvaluation.reason || 'oracle_not_ready';
+        }
+      }
+
+      // #1464 — Real-Time Anomaly Detection & Flash Loan Quarantine Gate
+      let anomalyEvaluation = null;
+      if (isDue && this.fraudDetection) {
+        if (typeof this.fraudDetection.isTaskQuarantined === 'function' && this.fraudDetection.isTaskQuarantined(taskId)) {
+          isDue = false;
+          reason = 'quarantined_anomaly';
+        } else if (taskConfig.executionTelemetry && typeof this.fraudDetection.evaluateFlashLoanAnomaly === 'function') {
+          anomalyEvaluation = this.fraudDetection.evaluateFlashLoanAnomaly({
+            taskId,
+            ...taskConfig.executionTelemetry,
+          });
+          if (anomalyEvaluation.isAnomalous) {
+            isDue = false;
+            reason = 'quarantined_anomaly';
+            taskLogger.warn('Task auto-paused by anomaly detection engine before execution', {
+              taskId,
+              anomalyScore: anomalyEvaluation.anomalyScore,
+              reasons: anomalyEvaluation.reasons,
+            });
+          }
+        }
+      }
+
+      // #1429 — Predictive task readiness ML model ahead of block close
+      let readinessPrediction = null;
+      if (this.readinessPredictor) {
+        readinessPrediction = this.readinessPredictor.predictReadiness(taskConfig, {
+          timestamp: currentTimestamp,
+          sequence: this.lastObservedLedger || 1000,
+        });
+      }
+
       return {
         isDue,
         taskId,
         reason,
+        deps: taskConfig.deps || [],
         lateness: isDue ? lateness : 0,
         isUnacceptablyLate,
         correlationId,
@@ -692,6 +768,9 @@ class TaskPoller {
         driftSeconds,
         driftSeverity,
         resolver,
+        oracle: oracleEvaluation,
+        anomaly: anomalyEvaluation,
+        readiness: readinessPrediction,
       };
 
     } catch (error) {
@@ -715,6 +794,35 @@ class TaskPoller {
     }
 
     return null;
+  }
+
+  /**
+   * #1455 — Evaluate multi-source oracle condition for an oracle-dependent task.
+   *
+   * @param {number} taskId
+   * @param {object} taskConfig
+   * @param {object} [options={}]
+   * @returns {Promise<object|null>}
+   */
+  async evaluateOracleGate(taskId, taskConfig, options = {}) {
+    const condition = taskConfig && (taskConfig.oracleCondition || taskConfig.oracle);
+    if (!condition || !this.oracleAggregator) {
+      return null;
+    }
+    const taskLogger = options.taskLogger || this.logger;
+    try {
+      return await this.oracleAggregator.evaluatePriceCondition(condition);
+    } catch (error) {
+      taskLogger.error('Oracle condition evaluation failed', {
+        taskId,
+        error: error.message,
+      });
+      return {
+        isReady: false,
+        reason: 'oracle_error',
+        error: error.message,
+      };
+    }
   }
 
   async evaluateResolverGate(taskId, taskConfig, currentTimestamp, options = {}) {
@@ -914,6 +1022,8 @@ class TaskPoller {
       if (raw.args !== undefined) config.args = raw.args;
       if (raw.resolver !== undefined) config.resolver = raw.resolver;
       if (raw.whitelist !== undefined) config.whitelist = raw.whitelist;
+      if (raw.deps !== undefined) config.deps = raw.deps;
+      if (raw.dependencies !== undefined) config.deps = raw.dependencies;
 
       return config;
     } catch (error) {

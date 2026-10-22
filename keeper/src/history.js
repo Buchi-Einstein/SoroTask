@@ -940,4 +940,3 @@ module.exports = {
   PostgresPartitionManager,
   ParquetExporter,
 };
-

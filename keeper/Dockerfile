@@ -27,8 +27,12 @@ COPY --from=deps /app/node_modules ./node_modules
 # Copy application files
 COPY . .
 
-# Expose the metrics/health port
-EXPOSE 3000
+# Expose metrics and health ports
+EXPOSE 3000 3001
+
+VOLUME ["/tmp"]
+
+STOPSIGNAL SIGTERM
 
 # SECURITY: Run as non-root UID 10001 (distroless nonroot user)
 USER nonroot:nonroot

@@ -1,5 +1,6 @@
 import type { NextConfig } from "next";
-import { withSentryConfig } from "@sentry/nextjs/config";
+import createNextIntlPlugin from "next-intl/plugin";
+import { withSentryConfig } from "@sentry/nextjs";
 
 const securityHeaders = [
   {
@@ -22,7 +23,34 @@ const securityHeaders = [
     key: "Permissions-Policy",
     value: "camera=(), microphone=(), geolocation=()",
   },
+  {
+    key: "X-DNS-Prefetch-Control",
+    value: "on",
+  },
 ];
+
+const pluginFrameOrigins = (process.env.NEXT_PUBLIC_SOROTASK_PLUGIN_ORIGINS ?? "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean)
+  .map((origin) => {
+    const url = new URL(origin);
+
+    if (
+      url.protocol !== "https:" ||
+      url.username ||
+      url.password ||
+      url.pathname !== "/" ||
+      url.search ||
+      url.hash
+    ) {
+      throw new Error(
+        `Invalid plugin origin "${origin}". Plugin origins must be HTTPS origins without a path.`,
+      );
+    }
+
+    return url.origin;
+  });
 
 const nextConfig: NextConfig = {
   compress: true,
@@ -43,72 +71,14 @@ const nextConfig: NextConfig = {
   typescript: {
     ignoreBuildErrors: true,
   },
-  webpack: (config, { isServer }) => {
-    // Enable WASM async module support and streaming
-    config.experiments = {
-      ...config.experiments,
-      asyncWebAssembly: true,
-      layers: true,
-    };
-
-    // Optimize vendor chunk splitting for heavy crypto/math libraries
-    if (!isServer && config.optimization?.splitChunks) {
-      config.optimization.splitChunks = {
-        ...config.optimization.splitChunks,
-        chunks: "all",
-        maxInitialRequests: 25,
-        minSize: 20000,
-        cacheGroups: {
-          ...config.optimization.splitChunks.cacheGroups,
-          stellar: {
-            test: /[\\/]node_modules[\\/](@stellar|stellar-sdk)[\\/]/,
-            name: "vendor-stellar",
-            priority: 40,
-            enforce: true,
-          },
-          cryptoModules: {
-            test: /[\\/]node_modules[\\/](snarkjs|circomlibjs|elliptic|bn\.js)[\\/]/,
-            name: "vendor-crypto-zk",
-            priority: 35,
-            enforce: true,
-          },
-          charts: {
-            test: /[\\/]node_modules[\\/](recharts|d3|d3-[^\\/]+)[\\/]/,
-            name: "vendor-charts",
-            priority: 30,
-            enforce: true,
-          },
-          graph: {
-            test: /[\\/]node_modules[\\/](reactflow|dagre|three)[\\/]/,
-            name: "vendor-graph",
-            priority: 25,
-            enforce: true,
-          },
-        },
-      };
-    }
-
-    return config;
-  },
   async headers() {
     return [
       {
         source: "/:path*",
         headers: [
-          ...securityHeaders,
           {
-            key: "Link",
-            value:
-              "<https://soroban-testnet.stellar.org>; rel=preconnect; crossorigin, <https://rpc-mainnet.stellar.org>; rel=dns-prefetch",
-          },
-        ],
-      },
-      {
-        source: "/_next/static/:path*",
-        headers: [
-          {
-            key: "Cache-Control",
-            value: "public, max-age=31536000, immutable",
+            key: "Content-Security-Policy",
+            value: `frame-src 'self' ${pluginFrameOrigins.join(" ")};`,
           },
         ],
       },
@@ -116,12 +86,16 @@ const nextConfig: NextConfig = {
   },
 };
 
+const withNextIntl = createNextIntlPlugin("./i18n/request.ts");
+
+const withIntl = withNextIntl(nextConfig);
+
 // Issue #813: wrap the default config so Sentry's webpack plugin instruments
 // client, server, and edge bundles and uploads source maps on build. Runtime
 // init lives in sentry.client/server/edge.config.ts; breadcrumbs for wallet
 // connection and transaction lifecycle events are captured in
 // src/lib/errors/breadcrumbs.ts.
-export default withSentryConfig(nextConfig, {
+export default withSentryConfig(withIntl, {
   // Options below are only consulted when the corresponding env vars/org are
   // configured; builds without a Sentry DSN simply skip source-map upload.
   org: process.env.SENTRY_ORG,

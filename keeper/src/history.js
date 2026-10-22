@@ -391,6 +391,122 @@ class HistoryManager {
     }
   }
 
+  /**
+   * Get recent history (for simple debugging/audit)
+   * @param {number} limit - Number of recent records to return
+   * @returns {Promise<Object[]>}
+   */
+  async getRecent(limit = 100) {
+    try {
+      await this.writeQueue;
+      if (!fs.existsSync(HISTORY_FILE)) return [];
+
+      const content = await fs.promises.readFile(HISTORY_FILE, 'utf-8');
+      const lines = content.trim().split('\n');
+      return lines
+        .slice(-limit)
+        .reverse()
+        .map(line => JSON.parse(line));
+    } catch (err) {
+      this.logger.error('Failed to read execution history', { error: err.message });
+      return [];
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Issue #1451 — Blockchain Reorganization Detection & Recovery Tracking
+  // -------------------------------------------------------------------------
+
+  /**
+   * Record a blockchain reorganization event.
+   * This is used to track when the indexer detects a reorg and triggers rollback.
+   *
+   * @param {Object} reorgDetails
+   * @param {number} reorgDetails.rollbackToSequence - The ledger sequence rolled back to
+   * @param {number} reorgDetails.deletedEvents - Number of events deleted
+   * @param {number} reorgDetails.deletedTasks - Number of tasks deleted
+   * @param {number} [reorgDetails.requeuedTasks] - Number of tasks re-queued
+   * @param {number[]} [reorgDetails.affectedTaskIds] - Task IDs affected by the reorg
+   * @param {string} [reorgDetails.reason] - Reason for rollback (e.g., 'hash_mismatch')
+   */
+  recordReorg(reorgDetails) {
+    const entry = {
+      kind: 'blockchain_reorg',
+      timestamp: new Date().toISOString(),
+      ...reorgDetails,
+    };
+
+    this.recentExecutions.push(entry);
+    if (this.recentExecutions.length > this.maxRecentExecutions) {
+      this.recentExecutions.shift();
+    }
+
+    const line = JSON.stringify(entry) + '\n';
+    this.writeQueue = this.writeQueue
+      .then(() => fs.promises.appendFile(HISTORY_FILE, line))
+      .catch((err) => {
+        this.logger.error('Failed to persist reorg record', { error: err.message });
+      });
+
+    this.logger.warn('Blockchain reorganization recorded', reorgDetails);
+    return entry;
+  }
+
+  /**
+   * Record that tasks have been re-queued after a reorg rollback.
+   *
+   * @param {Object} details
+   * @param {number[]} details.taskIds - Task IDs that were re-queued
+   * @param {number} details.rollbackToSequence - The ledger sequence rolled back to
+   * @param {number} details.count - Number of tasks re-queued
+   */
+  recordTaskRequeue(details) {
+    const entry = {
+      kind: 'task_requeue_after_reorg',
+      timestamp: new Date().toISOString(),
+      ...details,
+    };
+
+    this.recentExecutions.push(entry);
+    if (this.recentExecutions.length > this.maxRecentExecutions) {
+      this.recentExecutions.shift();
+    }
+
+    const line = JSON.stringify(entry) + '\n';
+    this.writeQueue = this.writeQueue
+      .then(() => fs.promises.appendFile(HISTORY_FILE, line))
+      .catch((err) => {
+        this.logger.error('Failed to persist task requeue record', { error: err.message });
+      });
+
+    this.logger.info('Task re-queue after reorg recorded', details);
+    return entry;
+  }
+
+  /**
+   * Get reorg-related records from history.
+   *
+   * @param {number} limit
+   * @returns {Promise<Object[]>}
+   */
+  async getReorgHistory(limit = 50) {
+    try {
+      await this.writeQueue;
+      if (!fs.existsSync(HISTORY_FILE)) return [];
+
+      const content = await fs.promises.readFile(HISTORY_FILE, 'utf-8');
+      const lines = content.trim().split('\n');
+      return lines
+        .map(line => JSON.parse(line))
+        .filter(entry => entry.kind === 'blockchain_reorg' || entry.kind === 'task_requeue_after_reorg')
+        .slice(-limit)
+        .reverse();
+    } catch (err) {
+      this.logger.error('Failed to read reorg history', { error: err.message });
+      return [];
+    }
+  }
+
   // -------------------------------------------------------------------------
   // Issue #842 — Audit reporting: CSV + PDF monthly statements
   // -------------------------------------------------------------------------
@@ -571,6 +687,156 @@ class HistoryManager {
 }
 
 // ---------------------------------------------------------------------------
+// Issue #1457 — Automated Database Partitioning & Archival Lifecycle Engine
+// Declarative monthly range partitioning for PostgreSQL execution tables.
+// ---------------------------------------------------------------------------
+
+/**
+ * Manages PostgreSQL declarative range partitioning by month for execution
+ * history tables.  Provides:
+ *   - setupPartitionedTable: create a parent table partitioned by RANGE (created_at)
+ *   - ensurePartition: create the upcoming month's partition ahead of time
+ *   - rotatePartitions: drop/archive partitions older than 90 days
+ *
+ * Designed to be used by a lifecycle daemon (cron) so active database size
+ * stays capped and query performance remains constant regardless of total
+ * history volume.
+ */
+class PostgresPartitionManager {
+  constructor(pool, opts = {}) {
+    this.pool = pool;
+    this.logger = opts.logger || console;
+    this.tableName = opts.tableName || 'task_executions';
+    this.partitionColumn = opts.partitionColumn || 'created_at';
+    this.retentionDays = opts.retentionDays || 90;
+  }
+
+  /** Quote a SQL identifier safely. */
+  _ident(name) {
+    return '"' + String(name).replace(/"/g, '""') + '"';
+  }
+
+  /** ISO month key (YYYY-MM) for a timestamp. */
+  _monthKey(ts) {
+    const d = ts instanceof Date ? ts : new Date(ts);
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+  }
+
+  /** First day of a YYYY-MM month as a Date (UTC). */
+  _monthStart(monthKey) {
+    const [y, m] = monthKey.split('-').map(Number);
+    return new Date(Date.UTC(y, m - 1, 1));
+  }
+
+  /** Next month key given a YYYY-MM string. */
+  _nextMonth(monthKey) {
+    const [y, m] = monthKey.split('-').map(Number);
+    const next = new Date(Date.UTC(y, m - 1, 1));
+    next.setUTCMonth(next.getUTCMonth() + 1);
+    return `${next.getUTCFullYear()}-${String(next.getUTCMonth() + 1).padStart(2, '0')}`;
+  }
+
+  /** Partition table name for a month. */
+  _partitionName(monthKey) {
+    return `${this.tableName}_y${monthKey.replace('-', '_')}`;
+  }
+
+  /**
+   * Create the parent partitioned table if it does not exist, partitioned by
+   * RANGE on the configured timestamp column.
+   */
+  async setupPartitionedTable(columnsSql) {
+    const table = this._ident(this.tableName);
+    const col = this._ident(this.partitionColumn);
+    const sql = `
+      CREATE TABLE IF NOT EXISTS ${table} (
+        ${columnsSql}
+      ) PARTITION BY RANGE (${col});
+    `;
+    await this.pool.query(sql);
+    this.logger.info('Partitioned table ensured', { table: this.tableName });
+  }
+
+  /**
+   * Create the partition for a given YYYY-MM month if it does not exist.
+   * Partition bound: [firstOfMonth, firstOfNextMonth).
+   */
+  async ensurePartition(monthKey) {
+    const start = this._monthStart(monthKey);
+    const next = new Date(start.getTime());
+    next.setUTCMonth(next.getUTCMonth() + 1);
+    const part = this._ident(this._partitionName(monthKey));
+    const table = this._ident(this.tableName);
+    const col = this._ident(this.partitionColumn);
+    const sql = `
+      CREATE TABLE IF NOT EXISTS ${part}
+      PARTITION OF ${table}
+      FOR VALUES FROM ($1) TO ($2);
+    `;
+    await this.pool.query(sql, [
+      start.toISOString(),
+      next.toISOString(),
+    ]);
+    this.logger.info('Partition ensured', { partition: this._partitionName(monthKey), month: monthKey });
+  }
+
+  /**
+   * Ensure partitions exist for the current month and the next N months
+   * (lookahead) so upcoming executions always have a target partition.
+   */
+  async ensureFuturePartitions(lookaheadMonths = 3) {
+    const now = new Date();
+    for (let i = 0; i <= lookaheadMonths; i++) {
+      const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + i, 1));
+      const monthKey = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+      await this.ensurePartition(monthKey);
+    }
+  }
+
+  /**
+   * Drop partitions older than retentionDays and move their data to an archive
+   * schema (cold storage).  In this implementation the partition is detached
+   * and moved to an `archive` schema so it remains queryable via SQL while no
+   * longer contributing to the active table's size.
+   */
+  async rotatePartitions() {
+    const cutoff = new Date(Date.now() - this.retentionDays * 24 * 60 * 60 * 1000);
+    const cutoffKey = this._monthKey(cutoff);
+
+    // List existing partitions via pg_inherits
+    const listSql = `
+      SELECT c.relname AS partition_name
+      FROM pg_inherits i
+      JOIN pg_class p ON p.oid = i.inhparent
+      JOIN pg_class c ON c.oid = i.inhrelid
+      WHERE p.relname = $1;
+    `;
+    const { rows } = await this.pool.query(listSql, [this.tableName]);
+
+    const archiveSchema = this._ident('archive');
+    try { await this.pool.query(`CREATE SCHEMA IF NOT EXISTS ${archiveSchema};`); } catch (_e) {}
+
+    for (const row of rows) {
+      const partName = row.partition_name;
+      // Extract YYYY_MM from partition name
+      const m = partName.match(/y(\d{4})_(\d{2})$/);
+      if (!m) continue;
+      const monthKey = `${m[1]}-${m[2]}`;
+      if (monthKey < cutoffKey) {
+        const archiveName = this._ident(`archive.${partName}`);
+        const partIdent = this._ident(partName);
+        const table = this._ident(this.tableName);
+        // Detach partition (keeps data, removes from active table)
+        await this.pool.query(`ALTER TABLE ${table} DETACH PARTITION ${partIdent};`);
+        // Move into archive schema so it stays queryable via SQL
+        await this.pool.query(`ALTER TABLE ${partIdent} SET SCHEMA archive;`);
+        this.logger.info('Partition archived', { partition: partName, month: monthKey });
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Issue #1465 — High-Throughput Ledger Archive Data Exporter
 // Snappy-compressed Apache Parquet export to multi-cloud object storage.
 // ---------------------------------------------------------------------------
@@ -671,5 +937,6 @@ class ParquetExporter {
 
 module.exports = {
   HistoryManager,
+  PostgresPartitionManager,
   ParquetExporter,
 };

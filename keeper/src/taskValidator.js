@@ -88,6 +88,25 @@ function validateTaskPayload(taskConfig, args = [], options = {}) {
 }
 
 /**
+ * Minimal ZK gate for private keeper triggers (issue #1469).
+ * Verifies a proving-key artifact checksum once, keeps it warm in RAM,
+ * and returns a fast placeholder proof. Keeps memory bounded via the daemon.
+ */
+function validateZkTrigger(privateInputs = {}, options = {}) {
+  const { keyId, artifactBuffer, expectedSha256 } = options;
+  if (!keyId || !artifactBuffer || !expectedSha256) {
+    return { ok: false, reason: 'missing_zk_inputs' };
+  }
+  const { getSharedProver } = require('./zk/prover');
+  const prover = getSharedProver({ maxArtifacts: options.maxArtifacts });
+  if (!prover.isWarmed(keyId)) {
+    const warmed = prover.warm(keyId, artifactBuffer, expectedSha256);
+    if (!warmed.ok) return warmed;
+  }
+  return prover.prove(keyId, privateInputs);
+}
+
+/**
  * Validates contract bytecode using BytecodeScanner (#1447)
  * @param {Buffer|Uint8Array} bytecode
  * @param {Object} [options]
@@ -108,5 +127,6 @@ module.exports = {
   validateTaskPayload,
   validateContractBytecode,
   BytecodeScanner,
+  validateZkTrigger,
   LIMITS,
 };
